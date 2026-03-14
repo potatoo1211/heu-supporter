@@ -22,31 +22,47 @@ AtCoder Heuristic Contest (AHC) などのヒューリスティックコンテス
   - AtCoderの公式Webビジュアライザ（WASM）をローカルアプリ内に直接埋め込み可能。
   - CORS（オリジン間リソース共有）制限を回避する専用のローカルプロキシサーバーをRust側で稼働させ、シームレスなUIを実現。グラフの点をクリックするだけで、対象ケースのビジュアライザが即座に開きます。
 
-## 🛠️ 技術スタック
+## 📥 ダウンロードとインストール（おすすめ）
 
-- **Frontend:** React (TypeScript), Vite, Tailwind CSS, Monaco Editor, Recharts
-- **Backend:** Rust, Tauri, tiny_http (Local Proxy Server)
+一番簡単な方法は、完成済みのアプリをダウンロードすることです。
+以下のReleasesページから、お使いのOSに合った最新バージョンのインストーラーをダウンロードして実行してください。
 
-## 📥 インストールと起動
+👉 **[ダウンロードページ (Releases) はこちら](https://github.com/potatoo1211/heu-supporter/releases)**
 
-このツールを開発・実行するには、Node.js と Rust の環境が必要です。また、C++のコードを実行する場合は `g++` などのコンパイラがパスに通っている必要があります。
+- **Windowsをお使いの方:** `.msi` または `.exe` 形式のファイルをダウンロードしてください。
+- **Macをお使いの方:** `.dmg` または `.app` 形式のファイルをダウンロードしてください。
+- **Linuxをお使いの方:** `.deb` (Ubuntu等) または `.AppImage` 形式のファイルをダウンロードしてください。
+
+※ C++やRustのコードをアプリ内でコンパイル・実行する場合、ご自身のPCに `g++` や `rustc` などのコンパイラがインストールされ、パスが通っている必要があります。
+
+---
+
+## 🛠️ 開発環境の構築（開発者・カスタマイズしたい方向け）
+
+このツールの開発に参加したり、ご自身でソースコードからビルドしたりする場合は、[Node.js](https://nodejs.org/) と [Rust](https://www.rust-lang.org/) の環境が必要です。
 
 ### 1. リポジトリのクローン
-git clone https://github.com/potatoo1211/heu-supporter.git
+```bash
+git clone [https://github.com/potatoo1211/heu-supporter.git](https://github.com/potatoo1211/heu-supporter.git)
 cd heu-supporter
+```
 
 ### 2. 依存パッケージのインストール
+```bash
 npm install
+```
 
 ### 3. 開発モードで起動
+```bash
 npm run tauri dev
+```
 
 ### 📦 ビルド（実行ファイルの作成）
-ご自身のOS（Windows, Mac, Linux）向けに単独で動くアプリをビルドしたい場合は以下のコマンドを実行します。
-
+ご自身の環境でインストーラーや実行ファイルを生成したい場合は以下のコマンドを実行します。
+```bash
 npm run tauri build
-
-完了後、`src-tauri/target/release/bundle/` の中にインストーラーや実行ファイルが生成されます。
+```
+完了後、`src-tauri/target/release/bundle/` の中に各種ファイルが生成されます。
 
 ## 📖 使い方
 
