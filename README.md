@@ -1,7 +1,59 @@
-# Tauri + React + Typescript
+# Heu-Supporter 🥔
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+AtCoder Heuristic Contest (AHC) などのヒューリスティックコンテスト（マラソンマッチ）を快適に戦うための、最強のローカルサポートツールです。
+テストケースの生成、コードの編集、実行、そしてスコアの可視化・ビジュアライザへの連携までをこのアプリ1つで完結させることができます。
 
-## Recommended IDE Setup
+## ✨ 主な機能
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+- 📁 **コンテスト（ワークスペース）管理**
+  - 公式の `tools.zip` を読み込み、自動でローカル環境に展開・設定。
+  - 最新の更新日時順や名前順でのソートに対応し、複数コンテストを簡単に切り替え可能。
+- 📝 **統合コードエディタ**
+  - Monaco Editorを内蔵。アプリ内でそのまま C++ や Rust などのソルバを記述・編集可能。
+- 🚀 **テストケースの一括実行と管理**
+  - 入力ジェネレータを用いたテストケースの生成。
+  - ローカル実行によるスコア、実行時間、エラー状況のリアルタイム取得。
+  - 問題特有のパラメータ（`N`, `M` など）の自動抽出機能。
+- 📊 **高度なスコア分析（可視化）**
+  - Rechartsを用いた散布図・箱ひげ図によるスコア分布の可視化。
+  - カスタムヒットエリアの実装により、数千ケースの描画時でも軽量かつ正確なクリック・ホバー判定を実現。
+  - 過去の提出（サブミッション）との比較機能で、改善幅を一目で確認。
+- 🌐 **Webビジュアライザの透過的プロキシ（黒魔術）**
+  - AtCoderの公式Webビジュアライザ（WASM）をローカルアプリ内に直接埋め込み可能。
+  - CORS（オリジン間リソース共有）制限を回避する専用のローカルプロキシサーバーをRust側で稼働させ、シームレスなUIを実現。グラフの点をクリックするだけで、対象ケースのビジュアライザが即座に開きます。
+
+## 🛠️ 技術スタック
+
+- **Frontend:** React (TypeScript), Vite, Tailwind CSS, Monaco Editor, Recharts
+- **Backend:** Rust, Tauri, tiny_http (Local Proxy Server)
+
+## 📥 インストールと起動
+
+このツールを開発・実行するには、Node.js と Rust の環境が必要です。また、C++のコードを実行する場合は `g++` などのコンパイラがパスに通っている必要があります。
+
+### 1. リポジトリのクローン
+git clone https://github.com/potatoo1211/heu-supporter.git
+cd heu-supporter
+
+### 2. 依存パッケージのインストール
+npm install
+
+### 3. 開発モードで起動
+npm run tauri dev
+
+### 📦 ビルド（実行ファイルの作成）
+ご自身のOS（Windows, Mac, Linux）向けに単独で動くアプリをビルドしたい場合は以下のコマンドを実行します。
+
+npm run tauri build
+
+完了後、`src-tauri/target/release/bundle/` の中にインストーラーや実行ファイルが生成されます。
+
+## 📖 使い方
+
+1. **コンテストの作成**: 左メニューから「新規コンテスト作成」を選び、問題名や目標（最大化/最小化）を設定します。公式の `tools.zip` を指定すると自動でセットアップされます。
+2. **コードの記述**: エディタ画面でソルバを記述します。
+3. **実行と分析**: 「テストケース生成」で入力を作成し、「再生ボタン」で実行。右側のグラフでスコアの分布を確認します。
+4. **ビジュアライザ確認**: グラフ上で気になるテストケースの点をクリックすると、即座にビジュアライザが立ち上がり、視覚的に挙動を確認できます。
+
+## 📝 License
+This project is licensed under the MIT License.
