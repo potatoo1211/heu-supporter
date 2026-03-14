@@ -25,6 +25,7 @@ struct VisualizerData {
     html: String,
     input: String,
     output: String,
+    stderr: String,
     web_url: Option<String>,
     local_url: Option<String>,
 }
@@ -33,6 +34,91 @@ struct VisualizerData {
 struct ContestItem {
     name: String,
     updated_at: u64,
+}
+
+/// ドキュメントフォルダ内の共通ワークスペースディレクトリを返す
+/// Windows: %USERPROFILE%\Documents\AHCLocalSubmit
+/// macOS/Linux: ~/Documents/AHCLocalSubmit
+fn get_workspaces_dir() -> PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap());
+    let dir = home.join("Documents").join("AHCLocalSubmit");
+    fs::create_dir_all(&dir).unwrap_or_default();
+    dir
+}
+
+/// テンプレートHTML から不要要素を静的に除去する
+/// - <details>...</details> ブロック全体
+/// - 「問題文はこちら」「使い方」を含む <p>/<div>/<h2>/<h3>/<a> タグ（textarea/canvas/svgを含まないもの）
+fn strip_clutter_html(html: &str) -> String {
+    let mut result = html.to_string();
+
+    // 1. <details>...</details> を再帰的に除去
+    loop {
+        if let Some(start) = result.find("<details") {
+            // 対応する </details> を探す（ネスト考慮）
+            let mut depth = 0usize;
+            let mut pos = start;
+            let mut end_pos = None;
+            let lower = result.to_lowercase();
+            loop {
+                let next_open = lower[pos..].find("<details").map(|i| pos + i);
+                let next_close = lower[pos..].find("</details>").map(|i| pos + i);
+                match (next_open, next_close) {
+                    (Some(o), Some(c)) if o < c => { depth += 1; pos = o + 1; }
+                    (_, Some(c)) => {
+                        if depth == 0 { end_pos = Some(c + "</details>".len()); break; }
+                        depth -= 1; pos = c + 1;
+                    }
+                    _ => break,
+                }
+            }
+            if let Some(end) = end_pos {
+                result.replace_range(start..end, "");
+            } else { break; }
+        } else { break; }
+    }
+
+    // 2. 「問題文はこちら」「使い方」を含む行レベル要素を除去
+    for tag in &["p", "div", "h2", "h3", "h4", "a", "span", "li"] {
+        let open_tag = format!("<{}", tag);
+        let close_tag = format!("</{}>", tag);
+        loop {
+            let lower = result.to_lowercase();
+            // タグの開始位置を探す
+            let mut found = false;
+            let mut search_from = 0;
+            while let Some(start) = lower[search_from..].find(&open_tag).map(|i| search_from + i) {
+                // タグ全体の終わり（>）を探す
+                if let Some(rel_end) = lower[start..].find('>') {
+                    let tag_end = start + rel_end + 1;
+                    // 対応する閉じタグを探す
+                    if let Some(rel_close) = lower[tag_end..].find(&close_tag) {
+                        let close_start = tag_end + rel_close;
+                        let close_end = close_start + close_tag.len();
+                        let inner = &result[tag_end..close_start];
+                        // キーワードを含み、ビジュアライザ本体要素を持たない場合のみ削除
+                        if (inner.contains("問題文はこちら") || inner.contains("使い方"))
+                            && !inner.contains("<textarea")
+                            && !inner.contains("<canvas")
+                            && !inner.contains("<svg")
+                            && !inner.contains("<input")
+                        {
+                            result.replace_range(start..close_end, "");
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                search_from = start + 1;
+            }
+            if !found { break; }
+        }
+    }
+
+    result
 }
 
 fn find_tools_dir(contest_dir: &Path) -> PathBuf {
@@ -60,7 +146,7 @@ fn escape_html_for_srcdoc(html: &str) -> String {
 #[tauri::command]
 fn get_contests() -> Result<Vec<ContestItem>, String> {
     let mut contests = Vec::new();
-    let base_dir = std::env::current_dir().unwrap().join("workspaces");
+    let base_dir = get_workspaces_dir();
 
     if base_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(base_dir) {
@@ -87,7 +173,7 @@ fn get_contests() -> Result<Vec<ContestItem>, String> {
 
 #[tauri::command]
 async fn create_contest(name: String, zip_path: String, optimize_target: String, variables: String) -> Result<String, String> {
-    let target_dir = Path::new("./workspaces").join(&name);
+    let target_dir = &get_workspaces_dir().join(&name);
     if target_dir.exists() { return Err("既に同じ名前が存在します".to_string()); }
 
     let file = fs::File::open(&zip_path).map_err(|e| format!("ファイルが開けません: {}", e))?;
@@ -121,7 +207,7 @@ async fn create_contest(name: String, zip_path: String, optimize_target: String,
 
 #[tauri::command]
 async fn delete_contest(name: String) -> Result<String, String> {
-    let target_dir = Path::new("./workspaces").join(&name);
+    let target_dir = &get_workspaces_dir().join(&name);
     if target_dir.exists() {
         fs::remove_dir_all(&target_dir).map_err(|e| format!("削除失敗: {}", e))?;
         Ok(format!("{} を削除しました", name))
@@ -132,15 +218,15 @@ async fn delete_contest(name: String) -> Result<String, String> {
 
 #[tauri::command]
 async fn save_submissions(contest_name: String, data: String) -> Result<(), String> {
-    let base_dir = std::env::current_dir().unwrap();
-    let file_path = base_dir.join("workspaces").join(&contest_name).join("submissions.json");
+    let base_dir = get_workspaces_dir();
+    let file_path = base_dir.join(&contest_name).join("submissions.json");
     fs::write(file_path, data).map_err(|e| format!("保存失敗: {}", e))
 }
 
 #[tauri::command]
 async fn load_submissions(contest_name: String) -> Result<String, String> {
-    let base_dir = std::env::current_dir().unwrap();
-    let file_path = base_dir.join("workspaces").join(&contest_name).join("submissions.json");
+    let base_dir = get_workspaces_dir();
+    let file_path = base_dir.join(&contest_name).join("submissions.json");
     if file_path.exists() {
         fs::read_to_string(file_path).map_err(|e| format!("読込失敗: {}", e))
     } else {
@@ -150,8 +236,8 @@ async fn load_submissions(contest_name: String) -> Result<String, String> {
 
 #[tauri::command]
 async fn get_visualizer_data(contest_name: String, case_id: usize, submission_id: Option<String>) -> Result<VisualizerData, String> {
-    let base_dir = std::env::current_dir().unwrap();
-    let contest_dir = base_dir.join("workspaces").join(&contest_name);
+    let base_dir = get_workspaces_dir();
+    let contest_dir = base_dir.join(&contest_name);
     let tools_dir = find_tools_dir(&contest_dir);
     let exe_suffix = std::env::consts::EXE_SUFFIX;
 
@@ -169,6 +255,14 @@ async fn get_visualizer_data(contest_name: String, case_id: usize, submission_id
 
     let input_text = fs::read_to_string(&in_file).unwrap_or_default();
     let output_text = fs::read_to_string(&out_file).unwrap_or_default();
+
+    // エラー出力ファイルを読み込む（存在しなければ空文字）
+    let stderr_text = if let Some(ref sid) = submission_id {
+        let err_path = contest_dir.join("out").join(sid).join(format!("{:04}_err.txt", case_id));
+        fs::read_to_string(&err_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     let mut web_url = None;
     if let Ok(readme) = fs::read_to_string(tools_dir.join("README.md")) {
@@ -207,7 +301,14 @@ async fn get_visualizer_data(contest_name: String, case_id: usize, submission_id
         if !wasm_path.exists() { if let Ok(resp) = reqwest::get(format!("{}{}_bg.wasm", base_url, prefix)).await { if let Ok(b) = resp.bytes().await { let _ = fs::write(&wasm_path, b); } } }
         if !css_path.exists() { if let Ok(resp) = reqwest::get(format!("{}style.css", base_url)).await { if let Ok(b) = resp.bytes().await { let _ = fs::write(&css_path, b); } } }
 
-        // ★ HTML本体も初回のみダウンロードして保存。2回目以降は超高速＆完全オフライン！
+        // HTML本体も初回のみダウンロードして保存。2回目以降は超高速＆完全オフライン！
+        // 古いキャッシュ（クラッター除去前）が残っていれば削除して再取得
+        if template_html_path.exists() {
+            let cached = fs::read_to_string(&template_html_path).unwrap_or_default();
+            if cached.contains("<details") || cached.contains("問題文はこちら") || cached.contains("使い方") {
+                let _ = fs::remove_file(&template_html_path);
+            }
+        }
         let mut base_html_text = String::new();
         if template_html_path.exists() {
             base_html_text = fs::read_to_string(&template_html_path).unwrap_or_default();
@@ -219,6 +320,8 @@ async fn get_visualizer_data(contest_name: String, case_id: usize, submission_id
                 } else {
                     text.insert_str(0, &format!("<head>{}</head>", base_tag));
                 }
+                // 不要要素をキャッシュ前に静的除去（一度だけ実行）
+                text = strip_clutter_html(&text);
                 let _ = fs::write(&template_html_path, &text);
                 base_html_text = text;
             }
@@ -235,27 +338,6 @@ async fn get_visualizer_data(contest_name: String, case_id: usize, submission_id
 <script type="text/plain" id="my_in_data">{}</script>
 <script type="text/plain" id="my_out_data">{}</script>
 <script>
-// 不要なUI要素を削除（問題文リンク・使い方・Detailsブロック）
-const removeClutter = () => {{
-    // <details> 要素をすべて削除
-    document.querySelectorAll('details').forEach(el => el.remove());
-    // テキストノードに「問題文はこちら」「使い方」を含む要素を削除
-    const walk = (node) => {{
-        if (node.nodeType === Node.ELEMENT_NODE) {{
-            const text = node.innerText || '';
-            if (/問題文はこちら|使い方/.test(text) && node.tagName !== 'BODY' && node.tagName !== 'HTML') {{
-                // 子孫に textarea/canvas/svg が無ければ削除
-                if (!node.querySelector('textarea, canvas, svg, input')) {{
-                    node.remove();
-                    return;
-                }}
-            }}
-            Array.from(node.children).forEach(walk);
-        }}
-    }};
-    walk(document.body);
-}};
-
 const applyData = (inStr, outStr, seedValue) => {{
     const textareas = document.querySelectorAll('textarea');
     if (textareas.length >= 2) {{
@@ -268,33 +350,21 @@ const applyData = (inStr, outStr, seedValue) => {{
             element.dispatchEvent(new Event('input', {{ bubbles: true }}));
             element.dispatchEvent(new Event('change', {{ bubbles: true }}));
         }};
-        
-        // InputとOutputの書き換え
         setNativeValue(textareas[0], inStr);
         setNativeValue(textareas[1], outStr);
-        
-        // Seed欄の書き換え
         const seedInput = document.getElementById('seed');
-        if (seedInput) {{
-            setNativeValue(seedInput, seedValue);
-        }}
-        
-        // 自動再生はしない（ユーザーが▶を押すまで待つ）
-        
+        if (seedInput) {{ setNativeValue(seedInput, seedValue); }}
         return true;
     }}
     return false;
 }};
 
 window.addEventListener('load', () => {{
-    // 不要UI削除（DOMが安定してから少し待つ）
-    setTimeout(removeClutter, 300);
-
     let attempts = 0;
     const tryInject = setInterval(() => {{
         attempts++;
-        const inStr = document.getElementById('my_in_data').textContent.replace(/<\\\/script>/g, '<' + '/script>');
-        const outStr = document.getElementById('my_out_data').textContent.replace(/<\\\/script>/g, '<' + '/script>');
+        const inStr = document.getElementById('my_in_data').textContent.replace(/<\/script>/g, '<' + '/script>');
+        const outStr = document.getElementById('my_out_data').textContent.replace(/<\/script>/g, '<' + '/script>');
         if (applyData(inStr, outStr, "{}")) {{ clearInterval(tryInject); }}
         else if (attempts > 50) {{ clearInterval(tryInject); }}
     }}, 100);
@@ -316,7 +386,7 @@ window.addEventListener('message', (event) => {{
             }
             fs::write(&index_html_path, final_html).unwrap_or_default();
 
-            let relative_tools = tools_dir.strip_prefix(&base_dir.join("workspaces")).unwrap();
+            let relative_tools = tools_dir.strip_prefix(&base_dir).unwrap();
             let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
             local_url = Some(format!("http://127.0.0.1:14234/{}/web_vis/index.html", relative_tools.to_string_lossy().replace("\\", "/")));
         }
@@ -350,13 +420,13 @@ window.addEventListener('message', (event) => {{
         html = format!("<iframe srcdoc=\"{}\" style=\"width:100%; height:100vh; border:none; min-height:800px;\"></iframe>", escape_html_for_srcdoc(&html));
     }
 
-    Ok(VisualizerData { html, input: input_text, output: output_text, web_url, local_url })
+    Ok(VisualizerData { html, input: input_text, output: output_text, stderr: stderr_text, web_url, local_url })
 }
 
 #[tauri::command]
 async fn generate_inputs(contest_name: String, test_cases: usize) -> Result<String, String> {
-    let base_dir = std::env::current_dir().unwrap();
-    let contest_dir = base_dir.join("workspaces").join(&contest_name);
+    let base_dir = get_workspaces_dir();
+    let contest_dir = base_dir.join(&contest_name);
     let tools_dir = find_tools_dir(&contest_dir);
 
     let seeds_path = tools_dir.join("seeds.txt");
@@ -370,18 +440,76 @@ async fn generate_inputs(contest_name: String, test_cases: usize) -> Result<Stri
 
 #[tauri::command]
 async fn setup_submission(contest_name: String, code: String, language: String, test_cases: usize) -> Result<String, String> {
-    let base_dir = std::env::current_dir().unwrap();
-    let contest_dir = base_dir.join("workspaces").join(&contest_name);
+    let base_dir = get_workspaces_dir();
+    let contest_dir = base_dir.join(&contest_name);
     let tools_dir = find_tools_dir(&contest_dir);
     let exe_suffix = std::env::consts::EXE_SUFFIX;
     
-    let file_ext = if language == "cpp" { "cpp" } else { "py" };
+    let file_ext = if language == "cpp" { "cpp" } else if language == "rust" { "rs" } else { "py" };
     let src_path = contest_dir.join(format!("main.{}", file_ext));
     fs::write(&src_path, &code).map_err(|e| format!("保存失敗: {}", e))?;
 
     let exe_path = contest_dir.join(format!("a.out{}", exe_suffix));
     if language == "cpp" {
         let output = Command::new("g++").args(["-O3", src_path.to_str().unwrap(), "-o", exe_path.to_str().unwrap()]).output().map_err(|e| format!("コンパイル起動失敗: {}", e))?;
+        if !output.status.success() { return Err(format!("【コンパイルエラー】\n{}", String::from_utf8_lossy(&output.stderr))); }
+    } else if language == "rust" {
+        // rust_src/ に独立した Cargo プロジェクトを作成してビルド
+        let rust_dir = contest_dir.join("rust_src");
+        let rust_src_dir = rust_dir.join("src");
+        fs::create_dir_all(&rust_src_dir).map_err(|e| format!("ディレクトリ作成失敗: {}", e))?;
+
+        // AHC でよく使われるクレートのカタログ（crate名 → Cargo.toml 用のバージョン指定行）
+        let known_crates: Vec<(&str, &str)> = vec![
+            ("rand",           "rand = \"0.8\""),
+            ("rand_pcg",       "rand_pcg = \"0.3\""),
+            ("rand_chacha",    "rand_chacha = \"0.3\""),
+            ("rand_distr",     "rand_distr = \"0.4\""),
+            ("itertools",      "itertools = \"0.13\""),
+            ("proconio",       "proconio = \"0.4\""),
+            ("rustc_hash",     "rustc_hash = \"1.1\""),
+            ("indexmap",       "indexmap = \"2\""),
+            ("ndarray",        "ndarray = \"0.16\""),
+            ("ordered_float",  "ordered_float = \"4\""),
+            ("num",            "num = \"0.4\""),
+            ("num_integer",    "num-integer = \"0.1\""),
+            ("num_traits",     "num-traits = \"0.2\""),
+            ("priority_queue", "priority-queue = \"2\""),
+            ("fixedbitset",    "fixedbitset = \"0.4\""),
+            ("petgraph",       "petgraph = \"0.6\""),
+            ("regex",          "regex = \"1\""),
+        ];
+
+        // コードの use 文からクレート名を抽出
+        let mut needed_deps: Vec<String> = vec![];
+        for (crate_name, dep_line) in &known_crates {
+            // "use crate_name::" or "use crate_name;" or "extern crate crate_name"
+            let pattern1 = format!("use {}::", crate_name);
+            let pattern2 = format!("use {};", crate_name);
+            let pattern3 = format!("extern crate {}", crate_name);
+            let pattern4 = format!("{}::", crate_name); // 直接パス参照
+            if code.contains(&pattern1) || code.contains(&pattern2)
+                || code.contains(&pattern3) || code.contains(&pattern4) {
+                needed_deps.push(dep_line.to_string());
+            }
+        }
+
+        // Cargo.toml を毎回再生成（依存関係が変わる可能性があるため）
+        let cargo_toml_path = rust_dir.join("Cargo.toml");
+        let deps_section = if needed_deps.is_empty() {
+            String::new()
+        } else {
+            format!("\n[dependencies]\n{}\n", needed_deps.join("\n"))
+        };
+        let cargo_toml_content = format!(
+            "[package]\nname = \"solution\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"solution\"\npath = \"src/main.rs\"\n{}\n[profile.release]\nopt-level = 3\n",
+            deps_section
+        );
+        fs::write(&cargo_toml_path, &cargo_toml_content).map_err(|e| format!("Cargo.toml 作成失敗: {}", e))?;
+
+        // コードを src/main.rs に書き込み
+        fs::write(rust_src_dir.join("main.rs"), &code).map_err(|e| format!("保存失敗: {}", e))?;
+        let output = Command::new("cargo").env_remove("CARGO_TARGET_DIR").current_dir(&rust_dir).args(["build", "--release"]).output().map_err(|e| format!("Rustコンパイル起動失敗: {}", e))?;
         if !output.status.success() { return Err(format!("【コンパイルエラー】\n{}", String::from_utf8_lossy(&output.stderr))); }
     }
 
@@ -404,14 +532,18 @@ async fn setup_submission(contest_name: String, code: String, language: String, 
 
 #[tauri::command]
 async fn run_test_case(contest_name: String, language: String, case_id: usize, time_limit: f64, memory_limit: usize, submission_id: String) -> Result<TestCaseResult, String> {
-    let base_dir = std::env::current_dir().unwrap();
-    let contest_dir = base_dir.join("workspaces").join(&contest_name);
+    let base_dir = get_workspaces_dir();
+    let contest_dir = base_dir.join(&contest_name);
     let tools_dir = find_tools_dir(&contest_dir);
     let exe_suffix = std::env::consts::EXE_SUFFIX;
 
-    let file_ext = if language == "cpp" { "cpp" } else { "py" };
+    let file_ext = if language == "cpp" { "cpp" } else if language == "rust" { "rs" } else { "py" };
     let src_path = contest_dir.join(format!("main.{}", file_ext));
-    let exe_path = contest_dir.join(format!("a.out{}", exe_suffix));
+    let exe_path = if language == "rust" {
+        contest_dir.join("rust_src").join("target").join("release").join(format!("solution{}", exe_suffix))
+    } else {
+        contest_dir.join(format!("a.out{}", exe_suffix))
+    };
 
     let out_dir = contest_dir.join("out");
     fs::create_dir_all(&out_dir).unwrap_or_default();
@@ -435,15 +567,24 @@ async fn run_test_case(contest_name: String, language: String, case_id: usize, t
         #[cfg(unix)]
         let mut cmd = {
             let kb = memory_limit * 1024;
-            let user_cmd = if language == "cpp" { format!("ulimit -v {}; exec \"{}\"", kb, exe_path.to_str().unwrap()) } else { format!("ulimit -v {}; exec python3 \"{}\"", kb, src_path.to_str().unwrap()) };
-            if use_tester { let mut c = Command::new(&tester_bin); c.arg("sh").arg("-c").arg(&user_cmd); c } 
+            let user_cmd = if language == "python" {
+                format!("ulimit -v {}; exec python3 \"{}\"", kb, src_path.to_str().unwrap())
+            } else {
+                format!("ulimit -v {}; exec \"{}\"", kb, exe_path.to_str().unwrap())
+            };
+            if use_tester { let mut c = Command::new(&tester_bin); c.arg("sh").arg("-c").arg(&user_cmd); c }
             else { let mut c = Command::new("sh"); c.arg("-c").arg(&user_cmd); c }
         };
 
         #[cfg(not(unix))]
         let mut cmd = {
-            if use_tester { let mut c = Command::new(&tester_bin); if language == "cpp" { c.arg(&exe_path); } else { c.arg("python3").arg(&src_path); } c } 
-            else { if language == "cpp" { Command::new(&exe_path) } else { let mut py = Command::new("python3"); py.arg(&src_path); py } }
+            if language == "python" {
+                if use_tester { let mut c = Command::new(&tester_bin); c.arg("python3").arg(&src_path); c }
+                else { let mut c = Command::new("python3"); c.arg(&src_path); c }
+            } else {
+                if use_tester { let mut c = Command::new(&tester_bin); c.arg(&exe_path); c }
+                else { Command::new(&exe_path) }
+            }
         };
 
         let input_file_handle = match fs::File::open(&in_file) { Ok(f) => f, Err(e) => return Ok(TestCaseResult { id: case_id, score: 0, status: "RE".to_string(), time: 0.0, error_msg: e.to_string() }) };
@@ -523,8 +664,8 @@ fn resize_window(window: tauri::WebviewWindow, width: f64, height: f64) {
 
 #[tauri::command]
 async fn get_testcase_memos(contest_name: String) -> Result<HashMap<String, String>, String> {
-    let base_dir = std::env::current_dir().unwrap();
-    let memos_file = base_dir.join("workspaces").join(&contest_name).join("memos.json");
+    let base_dir = get_workspaces_dir();
+    let memos_file = base_dir.join(&contest_name).join("memos.json");
     
     if memos_file.exists() {
         let content = fs::read_to_string(memos_file).unwrap_or_else(|_| "{}".to_string());
@@ -537,8 +678,8 @@ async fn get_testcase_memos(contest_name: String) -> Result<HashMap<String, Stri
 
 #[tauri::command]
 async fn save_testcase_memo(contest_name: String, case_id: usize, memo: String) -> Result<(), String> {
-    let base_dir = std::env::current_dir().unwrap();
-    let contest_dir = base_dir.join("workspaces").join(&contest_name);
+    let base_dir = get_workspaces_dir();
+    let contest_dir = base_dir.join(&contest_name);
     let memos_file = contest_dir.join("memos.json");
 
     let mut memos: HashMap<String, String> = if memos_file.exists() {
@@ -577,8 +718,8 @@ impl Default for ContestConfig {
 
 #[tauri::command]
 async fn get_contest_config(contest_name: String) -> Result<ContestConfig, String> {
-    let base_dir = std::env::current_dir().unwrap();
-    let config_file = base_dir.join("workspaces").join(&contest_name).join("config.json");
+    let base_dir = get_workspaces_dir();
+    let config_file = base_dir.join(&contest_name).join("config.json");
 
     if config_file.exists() {
         let content = fs::read_to_string(config_file).unwrap_or_else(|_| "{}".to_string());
@@ -594,8 +735,8 @@ async fn get_contest_config(contest_name: String) -> Result<ContestConfig, Strin
 
 #[tauri::command]
 async fn save_contest_config(contest_name: String, config: ContestConfig) -> Result<(), String> {
-    let base_dir = std::env::current_dir().unwrap();
-    let contest_dir = base_dir.join("workspaces").join(&contest_name);
+    let base_dir = get_workspaces_dir();
+    let contest_dir = base_dir.join(&contest_name);
     
     if !contest_dir.exists() {
         fs::create_dir_all(&contest_dir).map_err(|e| format!("ディレクトリ作成失敗: {}", e))?
@@ -610,8 +751,8 @@ async fn save_contest_config(contest_name: String, config: ContestConfig) -> Res
 
 #[tauri::command]
 async fn get_testcase_variables(contest_name: String) -> Result<HashMap<usize, HashMap<String, f64>>, String> {
-    let base_dir = std::env::current_dir().unwrap();
-    let contest_dir = base_dir.join("workspaces").join(&contest_name);
+    let base_dir = get_workspaces_dir();
+    let contest_dir = base_dir.join(&contest_name);
     
     let config_file = contest_dir.join("config.json");
     let config: ContestConfig = if config_file.exists() {
@@ -669,8 +810,8 @@ async fn get_testcase_variables(contest_name: String) -> Result<HashMap<usize, H
 
 #[tauri::command]
 async fn update_tools_from_zip(contest_name: String, zip_path: String) -> Result<(), String> {
-    let base_dir = std::env::current_dir().unwrap();
-    let contest_dir = base_dir.join("workspaces").join(&contest_name);
+    let base_dir = get_workspaces_dir();
+    let contest_dir = base_dir.join(&contest_name);
     
     if !contest_dir.exists() {
         return Err("コンテストディレクトリが存在しません".to_string());
@@ -699,7 +840,7 @@ fn rename_contest(old_name: String, new_name: String) -> Result<(), String> {
         return Ok(());
     }
 
-    let base_dir = std::env::current_dir().unwrap().join("workspaces");
+    let base_dir = get_workspaces_dir();
     let old_dir = base_dir.join(&old_name);
     let new_dir = base_dir.join(&new_name);
 
@@ -739,7 +880,7 @@ fn main() {
 
     std::thread::spawn(|| {
         if let Ok(server) = tiny_http::Server::http("127.0.0.1:14234") {
-            let base_dir = std::env::current_dir().unwrap().join("workspaces");
+            let base_dir = get_workspaces_dir();
             for request in server.incoming_requests() {
                 let url = request.url().split('?').next().unwrap().trim_start_matches('/');
                 

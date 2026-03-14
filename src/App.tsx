@@ -11,7 +11,7 @@ type Submission = {
   status: string; memory: string; execTime: number; code: string; language: string; testCases: TestCaseResult[];
 };
 
-type VisData = { html: string; input: string; output: string; web_url: string | null; local_url: string | null };
+type VisData = { html: string; input: string; output: string; stderr: string; web_url: string | null; local_url: string | null };
 
 type ContestConfig = {
   name: string;
@@ -513,7 +513,12 @@ function App() {
   const [testCases, setTestCases] = useState(50);
   const [timeLimit, setTimeLimit] = useState(2.0);
   const [memoryLimit, setMemoryLimit] = useState(1024);
-  const [code, setCode] = useState(`#include <iostream>\nusing namespace std;\n\nint main() {\n    // ここにコードを記述\n    return 0;\n}`);
+  const DEFAULT_CODE: Record<string, string> = {
+    cpp: `#include <iostream>\nusing namespace std;\n\nint main() {\n    // ここにコードを記述\n    return 0;\n}`,
+    rust: `use std::io::{self, Read};\n\nfn main() {\n    let mut input = String::new();\n    io::stdin().read_to_string(&mut input).unwrap();\n    let mut iter = input.split_whitespace();\n    // ここにコードを記述\n}`,
+    python: `import sys\ninput = sys.stdin.readline\n\ndef main():\n    # ここにコードを記述\n    pass\n\nmain()`,
+  };
+  const [code, setCode] = useState(DEFAULT_CODE['cpp']);
 
   const [confirmDialog, setConfirmDialog] = useState<{ message: string; subMessage?: string; onConfirm: () => void; confirmLabel?: string } | null>(null);
 
@@ -551,7 +556,7 @@ function App() {
   // テストケース一覧のソート状態
   const [testCaseSort, setTestCaseSort] = useState<{ key: string; order: 'asc' | 'desc' }>({ key: 'id', order: 'asc' });
   // テストケースごとの入出力展開状態
-  const [expandedCaseIO, setExpandedCaseIO] = useState<Record<number, { input: string; output: string } | 'loading'>>({});
+  const [expandedCaseIO, setExpandedCaseIO] = useState<Record<number, { input: string; output: string; stderr: string } | 'loading'>>({});
 
   // ★ 追加: 統計タブ用のState
   const [selectedForStats, setSelectedForStats] = useState<Set<string>>(new Set());
@@ -581,6 +586,11 @@ function App() {
     setSelectedForStats(new Set());
     setVarFilters({});
   }, [currentContest]);
+
+  // 提出の選択が変わったら展開中のIOをリセット
+  useEffect(() => {
+    setExpandedCaseIO({});
+  }, [selectedSubId]);
 
   // submissions を先に計算
   const submissions = currentContest ? (submissionsMap[currentContest] || []) : [];
@@ -965,7 +975,7 @@ function App() {
     setExpandedCaseIO(prev => ({ ...prev, [caseId]: 'loading' }));
     try {
       const data = await invoke<VisData>('get_visualizer_data', { contestName: currentContest, caseId, submissionId: submissionId ?? null });
-      setExpandedCaseIO(prev => ({ ...prev, [caseId]: { input: data.input, output: data.output } }));
+      setExpandedCaseIO(prev => ({ ...prev, [caseId]: { input: data.input, output: data.output, stderr: data.stderr } }));
     } catch (e) {
       setExpandedCaseIO(prev => { const next = { ...prev }; delete next[caseId]; return next; });
       showStatus('error', String(e));
@@ -1155,8 +1165,15 @@ function App() {
           {activeTab === 'submit' && (
             <div className="bg-white border border-gray-300 rounded-lg shadow-sm flex flex-col h-[calc(100vh-140px)] min-h-[500px]">
               <div className="p-3 border-b border-gray-200 flex gap-4 items-center bg-gray-50 rounded-t-lg overflow-x-auto">
-                <select value={language} onChange={(e) => setLanguage(e.target.value)} className="border rounded p-1.5 text-sm font-bold bg-white">
+                <select value={language} onChange={(e) => {
+                  const lang = e.target.value;
+                  setLanguage(lang);
+                  // コードが初期状態に近ければテンプレートに切り替える
+                  const isTemplate = Object.values(DEFAULT_CODE).some(t => code.trim() === t.trim());
+                  if (isTemplate) setCode(DEFAULT_CODE[lang] ?? '');
+                }} className="border rounded p-1.5 text-sm font-bold bg-white">
                   <option value="cpp">C++ (GCC)</option>
+                  <option value="rust">Rust</option>
                   <option value="python">Python 3</option>
                 </select>
                 <div className="flex items-center gap-2 whitespace-nowrap">
@@ -1178,7 +1195,7 @@ function App() {
                 </button>
               </div>
               <div className="flex-1 relative">
-                <Editor height="100%" language={language === 'python' ? 'python' : 'cpp'} theme="vs-light" value={code} onChange={(v) => setCode(v || '')} options={{ fontSize: 14, minimap: { enabled: false } }} />
+                <Editor height="100%" language={language === 'python' ? 'python' : language === 'rust' ? 'rust' : 'cpp'} theme="vs-light" value={code} onChange={(v) => setCode(v || '')} options={{ fontSize: 14, minimap: { enabled: false } }} />
                 {isProcessing && <div className="absolute inset-0 bg-white/50 backdrop-blur-sm z-10 flex items-center justify-center"><Loader2 size={48} className="animate-spin text-blue-600" /></div>}
               </div>
             </div>
@@ -1337,26 +1354,37 @@ function App() {
                                     {expandedCaseIO[r.id] && expandedCaseIO[r.id] !== 'loading' && (
                                       <tr className="bg-gray-50 border-b">
                                         <td colSpan={8} className="px-4 py-3">
-                                          <div className="grid grid-cols-2 gap-4">
-                                            <div>
-                                              <div className="flex items-center justify-between mb-1">
-                                                <p className="text-xs font-bold text-gray-500 uppercase tracking-wide">Input</p>
-                                                <CopyButton text={(expandedCaseIO[r.id] as { input: string; output: string }).input} />
+                                          {(() => {
+                                            const io = expandedCaseIO[r.id] as { input: string; output: string; stderr: string };
+                                            const hasErr = !!io.stderr.trim();
+                                            return (
+                                              <div className={`grid gap-4 ${hasErr ? 'grid-cols-3' : 'grid-cols-2'}`}>
+                                                <div>
+                                                  <div className="flex items-center justify-between mb-1">
+                                                    <p className="text-xs font-bold text-gray-500 uppercase tracking-wide">Input</p>
+                                                    <CopyButton text={io.input} />
+                                                  </div>
+                                                  <pre className="text-xs font-mono bg-white border border-gray-200 rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap break-all text-gray-700">{io.input}</pre>
+                                                </div>
+                                                <div>
+                                                  <div className="flex items-center justify-between mb-1">
+                                                    <p className="text-xs font-bold text-gray-500 uppercase tracking-wide">Output</p>
+                                                    <CopyButton text={io.output} />
+                                                  </div>
+                                                  <pre className="text-xs font-mono bg-white border border-gray-200 rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap break-all text-gray-700">{io.output}</pre>
+                                                </div>
+                                                {hasErr && (
+                                                  <div>
+                                                    <div className="flex items-center justify-between mb-1">
+                                                      <p className="text-xs font-bold text-red-500 uppercase tracking-wide">Stderr</p>
+                                                      <CopyButton text={io.stderr} />
+                                                    </div>
+                                                    <pre className="text-xs font-mono bg-red-50 border border-red-200 rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap break-all text-red-700">{io.stderr}</pre>
+                                                  </div>
+                                                )}
                                               </div>
-                                              <pre className="text-xs font-mono bg-white border border-gray-200 rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap break-all text-gray-700">
-                                                {(expandedCaseIO[r.id] as { input: string; output: string }).input}
-                                              </pre>
-                                            </div>
-                                            <div>
-                                              <div className="flex items-center justify-between mb-1">
-                                                <p className="text-xs font-bold text-gray-500 uppercase tracking-wide">Output</p>
-                                                <CopyButton text={(expandedCaseIO[r.id] as { input: string; output: string }).output} />
-                                              </div>
-                                              <pre className="text-xs font-mono bg-white border border-gray-200 rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap break-all text-gray-700">
-                                                {(expandedCaseIO[r.id] as { input: string; output: string }).output}
-                                              </pre>
-                                            </div>
-                                          </div>
+                                            );
+                                          })()}
                                         </td>
                                       </tr>
                                     )}
@@ -1373,7 +1401,7 @@ function App() {
                       <div className="absolute top-2 right-3 z-10">
                         <CopyButton text={selectedSub.code} className="shadow-sm" />
                       </div>
-                      <Editor language={selectedSub.language === 'python' ? 'python' : 'cpp'} theme="vs-light" value={selectedSub.code} options={{ readOnly: true, minimap: { enabled: false }, fontSize: 14 }} />
+                      <Editor language={selectedSub.language === 'python' ? 'python' : selectedSub.language === 'rust' ? 'rust' : 'cpp'} theme="vs-light" value={selectedSub.code} options={{ readOnly: true, minimap: { enabled: false }, fontSize: 14 }} />
                     </div>
                   )}
                 </div>
