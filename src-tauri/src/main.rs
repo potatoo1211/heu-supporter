@@ -1,9 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, Write, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -64,18 +64,29 @@ fn strip_clutter_html(html: &str) -> String {
                 let next_open = lower[pos..].find("<details").map(|i| pos + i);
                 let next_close = lower[pos..].find("</details>").map(|i| pos + i);
                 match (next_open, next_close) {
-                    (Some(o), Some(c)) if o < c => { depth += 1; pos = o + 1; }
+                    (Some(o), Some(c)) if o < c => {
+                        depth += 1;
+                        pos = o + 1;
+                    }
                     (_, Some(c)) => {
-                        if depth == 0 { end_pos = Some(c + "</details>".len()); break; }
-                        depth -= 1; pos = c + 1;
+                        if depth == 0 {
+                            end_pos = Some(c + "</details>".len());
+                            break;
+                        }
+                        depth -= 1;
+                        pos = c + 1;
                     }
                     _ => break,
                 }
             }
             if let Some(end) = end_pos {
                 result.replace_range(start..end, "");
-            } else { break; }
-        } else { break; }
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
     }
 
     // 2. 「問題文はこちら」「使い方」を含む行レベル要素を除去
@@ -87,7 +98,10 @@ fn strip_clutter_html(html: &str) -> String {
             // タグの開始位置を探す
             let mut found = false;
             let mut search_from = 0;
-            while let Some(start) = lower[search_from..].find(&open_tag).map(|i| search_from + i) {
+            while let Some(start) = lower[search_from..]
+                .find(&open_tag)
+                .map(|i| search_from + i)
+            {
                 // タグ全体の終わり（>）を探す
                 if let Some(rel_end) = lower[start..].find('>') {
                     let tag_end = start + rel_end + 1;
@@ -111,7 +125,9 @@ fn strip_clutter_html(html: &str) -> String {
                 }
                 search_from = start + 1;
             }
-            if !found { break; }
+            if !found {
+                break;
+            }
         }
     }
 
@@ -120,12 +136,16 @@ fn strip_clutter_html(html: &str) -> String {
 
 fn find_tools_dir(contest_dir: &Path) -> PathBuf {
     let direct_tools = contest_dir.join("tools");
-    if direct_tools.exists() { return direct_tools; }
+    if direct_tools.exists() {
+        return direct_tools;
+    }
     if let Ok(entries) = fs::read_dir(contest_dir) {
         for entry in entries.flatten() {
             if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                 let nested_tools = entry.path().join("tools");
-                if nested_tools.exists() { return nested_tools; }
+                if nested_tools.exists() {
+                    return nested_tools;
+                }
             }
         }
     }
@@ -150,9 +170,10 @@ fn get_contests() -> Result<Vec<ContestItem>, String> {
             for entry in entries.flatten() {
                 if entry.file_type().map(|f| f.is_dir()).unwrap_or(false) {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    
+
                     // フォルダの最終更新日時を取得（取得失敗時は現在時刻）
-                    let updated_at = entry.metadata()
+                    let updated_at = entry
+                        .metadata()
                         .and_then(|m| m.modified())
                         .unwrap_or(std::time::SystemTime::now())
                         .duration_since(std::time::UNIX_EPOCH)
@@ -164,14 +185,21 @@ fn get_contests() -> Result<Vec<ContestItem>, String> {
             }
         }
     }
-    
+
     Ok(contests)
 }
 
 #[tauri::command]
-async fn create_contest(name: String, zip_path: String, optimize_target: String, variables: String) -> Result<String, String> {
+async fn create_contest(
+    name: String,
+    zip_path: String,
+    optimize_target: String,
+    variables: String,
+) -> Result<String, String> {
     let target_dir = &get_workspaces_dir().join(&name);
-    if target_dir.exists() { return Err("既に同じ名前が存在します".to_string()); }
+    if target_dir.exists() {
+        return Err("既に同じ名前が存在します".to_string());
+    }
 
     let file = fs::File::open(&zip_path).map_err(|e| format!("ファイルが開けません: {}", e))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("ZIP読込失敗: {}", e))?;
@@ -179,10 +207,16 @@ async fn create_contest(name: String, zip_path: String, optimize_target: String,
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-        let outpath = match file.enclosed_name() { Some(p) => target_dir.join(p), None => continue };
-        if (*file.name()).ends_with('/') { fs::create_dir_all(&outpath).map_err(|e| e.to_string())?; } 
-        else {
-            if let Some(p) = outpath.parent() { fs::create_dir_all(p).map_err(|e| e.to_string())?; }
+        let outpath = match file.enclosed_name() {
+            Some(p) => target_dir.join(p),
+            None => continue,
+        };
+        if (*file.name()).ends_with('/') {
+            fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
+        } else {
+            if let Some(p) = outpath.parent() {
+                fs::create_dir_all(p).map_err(|e| e.to_string())?;
+            }
             let mut outfile = fs::File::create(&outpath).map_err(|e| e.to_string())?;
             io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
         }
@@ -228,7 +262,10 @@ async fn reset_visualizer_cache(contest_name: String) -> Result<(), String> {
 #[tauri::command]
 async fn delete_submission_dir(contest_name: String, submission_id: String) -> Result<(), String> {
     let base_dir = get_workspaces_dir();
-    let sub_out_dir = base_dir.join(&contest_name).join("out").join(&submission_id);
+    let sub_out_dir = base_dir
+        .join(&contest_name)
+        .join("out")
+        .join(&submission_id);
     if sub_out_dir.exists() {
         fs::remove_dir_all(&sub_out_dir).map_err(|e| format!("削除失敗: {}", e))?;
     }
@@ -254,7 +291,11 @@ async fn load_submissions(contest_name: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn get_visualizer_data(contest_name: String, case_id: usize, submission_id: Option<String>) -> Result<VisualizerData, String> {
+async fn get_visualizer_data(
+    contest_name: String,
+    case_id: usize,
+    submission_id: Option<String>,
+) -> Result<VisualizerData, String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
     let tools_dir = find_tools_dir(&contest_dir);
@@ -264,20 +305,32 @@ async fn get_visualizer_data(contest_name: String, case_id: usize, submission_id
 
     // per-submission ファイルを優先、なければ共通 out/ にフォールバック
     let out_file = if let Some(ref sid) = submission_id {
-        let sub_path = contest_dir.join("out").join(sid).join(format!("{:04}.txt", case_id));
-        if sub_path.exists() { sub_path } else { contest_dir.join("out").join(format!("{:04}.txt", case_id)) }
+        let sub_path = contest_dir
+            .join("out")
+            .join(sid)
+            .join(format!("{:04}.txt", case_id));
+        if sub_path.exists() {
+            sub_path
+        } else {
+            contest_dir.join("out").join(format!("{:04}.txt", case_id))
+        }
     } else {
         contest_dir.join("out").join(format!("{:04}.txt", case_id))
     };
 
-    if !out_file.exists() { return Err("出力ファイルが存在しません。".to_string()); }
+    if !out_file.exists() {
+        return Err("出力ファイルが存在しません。".to_string());
+    }
 
     let input_text = fs::read_to_string(&in_file).unwrap_or_default();
     let output_text = fs::read_to_string(&out_file).unwrap_or_default();
 
     // エラー出力ファイルを読み込む（存在しなければ空文字）
     let stderr_text = if let Some(ref sid) = submission_id {
-        let err_path = contest_dir.join("out").join(sid).join(format!("{:04}_err.txt", case_id));
+        let err_path = contest_dir
+            .join("out")
+            .join(sid)
+            .join(format!("{:04}_err.txt", case_id));
         fs::read_to_string(&err_path).unwrap_or_default()
     } else {
         String::new()
@@ -288,9 +341,14 @@ async fn get_visualizer_data(contest_name: String, case_id: usize, submission_id
         let mut current_idx = 0;
         while let Some(start) = readme[current_idx..].find("https://img.atcoder.jp/") {
             let actual_start = current_idx + start;
-            let end = readme[actual_start..].find(|c: char| c.is_whitespace() || c == ')' || c == '"').unwrap_or(readme[actual_start..].len());
+            let end = readme[actual_start..]
+                .find(|c: char| c.is_whitespace() || c == ')' || c == '"')
+                .unwrap_or(readme[actual_start..].len());
             let url = &readme[actual_start..actual_start + end];
-            if url.contains(".html") { web_url = Some(url.to_string()); break; }
+            if url.contains(".html") {
+                web_url = Some(url.to_string());
+                break;
+            }
             current_idx = actual_start + end;
         }
     }
@@ -300,14 +358,22 @@ async fn get_visualizer_data(contest_name: String, case_id: usize, submission_id
 
     if let Some(url) = &web_url {
         let url_without_query = url.split('?').next().unwrap_or(url);
-        let base_url = url_without_query.rsplit('/').skip(1).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("/") + "/";
+        let base_url = url_without_query
+            .rsplit('/')
+            .skip(1)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("/")
+            + "/";
         let file_name = url_without_query.split('/').last().unwrap_or("");
         let prefix = file_name.replace(".html", "");
 
         let web_vis_dir = tools_dir.join("web_vis");
         fs::create_dir_all(&web_vis_dir).unwrap_or_default();
         let index_html_path = web_vis_dir.join("index.html");
-        
+
         // ★ テンプレートHTMLのパス
         let template_html_path = web_vis_dir.join("template.html");
 
@@ -316,9 +382,27 @@ async fn get_visualizer_data(contest_name: String, case_id: usize, submission_id
         let css_path = web_vis_dir.join("style.css");
 
         // JS/WASM/CSS のダウンロード（初回のみ）
-        if !js_path.exists() { if let Ok(resp) = reqwest::get(format!("{}{}.js", base_url, prefix)).await { if let Ok(b) = resp.bytes().await { let _ = fs::write(&js_path, b); } } }
-        if !wasm_path.exists() { if let Ok(resp) = reqwest::get(format!("{}{}_bg.wasm", base_url, prefix)).await { if let Ok(b) = resp.bytes().await { let _ = fs::write(&wasm_path, b); } } }
-        if !css_path.exists() { if let Ok(resp) = reqwest::get(format!("{}style.css", base_url)).await { if let Ok(b) = resp.bytes().await { let _ = fs::write(&css_path, b); } } }
+        if !js_path.exists() {
+            if let Ok(resp) = reqwest::get(format!("{}{}.js", base_url, prefix)).await {
+                if let Ok(b) = resp.bytes().await {
+                    let _ = fs::write(&js_path, b);
+                }
+            }
+        }
+        if !wasm_path.exists() {
+            if let Ok(resp) = reqwest::get(format!("{}{}_bg.wasm", base_url, prefix)).await {
+                if let Ok(b) = resp.bytes().await {
+                    let _ = fs::write(&wasm_path, b);
+                }
+            }
+        }
+        if !css_path.exists() {
+            if let Ok(resp) = reqwest::get(format!("{}style.css", base_url)).await {
+                if let Ok(b) = resp.bytes().await {
+                    let _ = fs::write(&css_path, b);
+                }
+            }
+        }
 
         // HTML本体も初回のみダウンロードして保存。2回目以降は超高速＆完全オフライン！
         let mut base_html_text = String::new();
@@ -341,12 +425,14 @@ async fn get_visualizer_data(contest_name: String, case_id: usize, submission_id
 
         if !base_html_text.is_empty() {
             // HTMLの中にあるAtCoderの直リンクを、すべてローカルのプロキシ経由にすり替える
-            let base_html_text = base_html_text.replace("https://img.atcoder.jp/", "http://127.0.0.1:14234/proxy/");
-            
+            let base_html_text =
+                base_html_text.replace("https://img.atcoder.jp/", "http://127.0.0.1:14234/proxy/");
+
             let safe_in = input_text.replace("</script>", "<\\/script>");
             let safe_out = output_text.replace("</script>", "<\\/script>");
 
-            let inject_script = format!(r#"
+            let inject_script = format!(
+                r#"
 <script type="text/plain" id="my_in_data">{}</script>
 <script type="text/plain" id="my_out_data">{}</script>
 <script>
@@ -388,7 +474,9 @@ window.addEventListener('message', (event) => {{
     }}
 }});
 </script>
-"#, safe_in, safe_out, case_id);
+"#,
+                safe_in, safe_out, case_id
+            );
 
             let mut final_html = base_html_text;
             if let Some(body_idx) = final_html.rfind("</body>") {
@@ -399,17 +487,40 @@ window.addEventListener('message', (event) => {{
             fs::write(&index_html_path, final_html).unwrap_or_default();
 
             let relative_tools = tools_dir.strip_prefix(&base_dir).unwrap();
-            let _timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
-            local_url = Some(format!("http://127.0.0.1:14234/{}/web_vis/index.html", relative_tools.to_string_lossy().replace("\\", "/")));
+            let _timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            local_url = Some(format!(
+                "http://127.0.0.1:14234/{}/web_vis/index.html",
+                relative_tools.to_string_lossy().replace("\\", "/")
+            ));
         }
     }
 
     if local_url.is_none() {
-        let vis_bin = tools_dir.join("target").join("release").join(format!("vis{}", exe_suffix));
+        let vis_bin = tools_dir
+            .join("target")
+            .join("release")
+            .join(format!("vis{}", exe_suffix));
         let output = if vis_bin.exists() {
-            Command::new(&vis_bin).current_dir(&tools_dir).args([in_file.to_str().unwrap(), out_file.to_str().unwrap()]).output()
+            Command::new(&vis_bin)
+                .current_dir(&tools_dir)
+                .args([in_file.to_str().unwrap(), out_file.to_str().unwrap()])
+                .output()
         } else {
-            Command::new("cargo").current_dir(&tools_dir).args(["run", "--release", "--bin", "vis", "--", in_file.to_str().unwrap(), out_file.to_str().unwrap()]).output()
+            Command::new("cargo")
+                .current_dir(&tools_dir)
+                .args([
+                    "run",
+                    "--release",
+                    "--bin",
+                    "vis",
+                    "--",
+                    in_file.to_str().unwrap(),
+                    out_file.to_str().unwrap(),
+                ])
+                .output()
         };
 
         if let Ok(o) = output {
@@ -432,7 +543,14 @@ window.addEventListener('message', (event) => {{
         html = format!("<iframe srcdoc=\"{}\" style=\"width:100%; height:100vh; border:none; min-height:800px;\"></iframe>", escape_html_for_srcdoc(&html));
     }
 
-    Ok(VisualizerData { html, input: input_text, output: output_text, stderr: stderr_text, web_url, local_url })
+    Ok(VisualizerData {
+        html,
+        input: input_text,
+        output: output_text,
+        stderr: stderr_text,
+        web_url,
+        local_url,
+    })
 }
 
 #[tauri::command]
@@ -443,28 +561,64 @@ async fn generate_inputs(contest_name: String, test_cases: usize) -> Result<Stri
 
     let seeds_path = tools_dir.join("seeds.txt");
     let mut seeds_file = fs::File::create(&seeds_path).map_err(|e| e.to_string())?;
-    for i in 0..test_cases { writeln!(seeds_file, "{}", i).map_err(|e| e.to_string())?; }
+    for i in 0..test_cases {
+        writeln!(seeds_file, "{}", i).map_err(|e| e.to_string())?;
+    }
 
-    let output = Command::new("cargo").env_remove("CARGO_TARGET_DIR").current_dir(&tools_dir).args(&["run", "--release", "--bin", "gen", "seeds.txt"]).output().map_err(|e| format!("gen起動失敗: {}", e))?;
-    if !output.status.success() { return Err(format!("生成エラー:\n{}", String::from_utf8_lossy(&output.stderr))); }
+    let output = Command::new("cargo")
+        .env_remove("CARGO_TARGET_DIR")
+        .current_dir(&tools_dir)
+        .args(&["run", "--release", "--bin", "gen", "seeds.txt"])
+        .output()
+        .map_err(|e| format!("gen起動失敗: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "生成エラー:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
     Ok(format!("{} 個のテストケース生成完了！", test_cases))
 }
 
 #[tauri::command]
-async fn setup_submission(contest_name: String, code: String, language: String, test_cases: usize) -> Result<String, String> {
+async fn setup_submission(
+    contest_name: String,
+    code: String,
+    language: String,
+    test_cases: usize,
+) -> Result<String, String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
     let tools_dir = find_tools_dir(&contest_dir);
     let exe_suffix = std::env::consts::EXE_SUFFIX;
-    
-    let file_ext = if language == "cpp" { "cpp" } else if language == "rust" { "rs" } else { "py" };
+
+    let file_ext = if language == "cpp" {
+        "cpp"
+    } else if language == "rust" {
+        "rs"
+    } else {
+        "py"
+    };
     let src_path = contest_dir.join(format!("main.{}", file_ext));
     fs::write(&src_path, &code).map_err(|e| format!("保存失敗: {}", e))?;
 
     let exe_path = contest_dir.join(format!("a.out{}", exe_suffix));
     if language == "cpp" {
-        let output = Command::new("g++").args(["-O3", src_path.to_str().unwrap(), "-o", exe_path.to_str().unwrap()]).output().map_err(|e| format!("コンパイル起動失敗: {}", e))?;
-        if !output.status.success() { return Err(format!("【コンパイルエラー】\n{}", String::from_utf8_lossy(&output.stderr))); }
+        let output = Command::new("g++")
+            .args([
+                "-O3",
+                src_path.to_str().unwrap(),
+                "-o",
+                exe_path.to_str().unwrap(),
+            ])
+            .output()
+            .map_err(|e| format!("コンパイル起動失敗: {}", e))?;
+        if !output.status.success() {
+            return Err(format!(
+                "【コンパイルエラー】\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
     } else if language == "rust" {
         // rust_src/ に独立した Cargo プロジェクトを作成してビルド
         let rust_dir = contest_dir.join("rust_src");
@@ -473,23 +627,23 @@ async fn setup_submission(contest_name: String, code: String, language: String, 
 
         // AHC でよく使われるクレートのカタログ（crate名 → Cargo.toml 用のバージョン指定行）
         let known_crates: Vec<(&str, &str)> = vec![
-            ("rand",           "rand = \"0.8\""),
-            ("rand_pcg",       "rand_pcg = \"0.3\""),
-            ("rand_chacha",    "rand_chacha = \"0.3\""),
-            ("rand_distr",     "rand_distr = \"0.4\""),
-            ("itertools",      "itertools = \"0.13\""),
-            ("proconio",       "proconio = \"0.4\""),
-            ("rustc_hash",     "rustc_hash = \"1.1\""),
-            ("indexmap",       "indexmap = \"2\""),
-            ("ndarray",        "ndarray = \"0.16\""),
-            ("ordered_float",  "ordered_float = \"4\""),
-            ("num",            "num = \"0.4\""),
-            ("num_integer",    "num-integer = \"0.1\""),
-            ("num_traits",     "num-traits = \"0.2\""),
+            ("rand", "rand = \"0.8\""),
+            ("rand_pcg", "rand_pcg = \"0.3\""),
+            ("rand_chacha", "rand_chacha = \"0.3\""),
+            ("rand_distr", "rand_distr = \"0.4\""),
+            ("itertools", "itertools = \"0.13\""),
+            ("proconio", "proconio = \"0.4\""),
+            ("rustc_hash", "rustc_hash = \"1.1\""),
+            ("indexmap", "indexmap = \"2\""),
+            ("ndarray", "ndarray = \"0.16\""),
+            ("ordered_float", "ordered_float = \"4\""),
+            ("num", "num = \"0.4\""),
+            ("num_integer", "num-integer = \"0.1\""),
+            ("num_traits", "num-traits = \"0.2\""),
             ("priority_queue", "priority-queue = \"2\""),
-            ("fixedbitset",    "fixedbitset = \"0.4\""),
-            ("petgraph",       "petgraph = \"0.6\""),
-            ("regex",          "regex = \"1\""),
+            ("fixedbitset", "fixedbitset = \"0.4\""),
+            ("petgraph", "petgraph = \"0.6\""),
+            ("regex", "regex = \"1\""),
         ];
 
         // コードの use 文からクレート名を抽出
@@ -500,8 +654,11 @@ async fn setup_submission(contest_name: String, code: String, language: String, 
             let pattern2 = format!("use {};", crate_name);
             let pattern3 = format!("extern crate {}", crate_name);
             let pattern4 = format!("{}::", crate_name); // 直接パス参照
-            if code.contains(&pattern1) || code.contains(&pattern2)
-                || code.contains(&pattern3) || code.contains(&pattern4) {
+            if code.contains(&pattern1)
+                || code.contains(&pattern2)
+                || code.contains(&pattern3)
+                || code.contains(&pattern4)
+            {
                 needed_deps.push(dep_line.to_string());
             }
         }
@@ -517,16 +674,37 @@ async fn setup_submission(contest_name: String, code: String, language: String, 
             "[package]\nname = \"solution\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"solution\"\npath = \"src/main.rs\"\n{}\n[profile.release]\nopt-level = 3\n",
             deps_section
         );
-        fs::write(&cargo_toml_path, &cargo_toml_content).map_err(|e| format!("Cargo.toml 作成失敗: {}", e))?;
+        fs::write(&cargo_toml_path, &cargo_toml_content)
+            .map_err(|e| format!("Cargo.toml 作成失敗: {}", e))?;
 
         // コードを src/main.rs に書き込み
         fs::write(rust_src_dir.join("main.rs"), &code).map_err(|e| format!("保存失敗: {}", e))?;
-        let output = Command::new("cargo").env_remove("CARGO_TARGET_DIR").current_dir(&rust_dir).args(["build", "--release"]).output().map_err(|e| format!("Rustコンパイル起動失敗: {}", e))?;
-        if !output.status.success() { return Err(format!("【コンパイルエラー】\n{}", String::from_utf8_lossy(&output.stderr))); }
+        let output = Command::new("cargo")
+            .env_remove("CARGO_TARGET_DIR")
+            .current_dir(&rust_dir)
+            .args(["build", "--release"])
+            .output()
+            .map_err(|e| format!("Rustコンパイル起動失敗: {}", e))?;
+        if !output.status.success() {
+            return Err(format!(
+                "【コンパイルエラー】\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
     }
 
-    let build_output = Command::new("cargo").env_remove("CARGO_TARGET_DIR").current_dir(&tools_dir).args(["build", "--release"]).output().map_err(|e| format!("ツール群のビルド起動失敗: {}", e))?;
-    if !build_output.status.success() { return Err(format!("ツールビルドエラー:\n{}", String::from_utf8_lossy(&build_output.stderr))); }
+    let build_output = Command::new("cargo")
+        .env_remove("CARGO_TARGET_DIR")
+        .current_dir(&tools_dir)
+        .args(["build", "--release"])
+        .output()
+        .map_err(|e| format!("ツール群のビルド起動失敗: {}", e))?;
+    if !build_output.status.success() {
+        return Err(format!(
+            "ツールビルドエラー:\n{}",
+            String::from_utf8_lossy(&build_output.stderr)
+        ));
+    }
 
     let in_dir = tools_dir.join("in");
     fs::create_dir_all(&in_dir).unwrap_or_default();
@@ -535,24 +713,47 @@ async fn setup_submission(contest_name: String, code: String, language: String, 
     if is_missing {
         let seeds_path = tools_dir.join("seeds.txt");
         if let Ok(mut seeds_file) = fs::File::create(&seeds_path) {
-            for i in 0..test_cases { let _ = writeln!(seeds_file, "{}", i); }
+            for i in 0..test_cases {
+                let _ = writeln!(seeds_file, "{}", i);
+            }
         }
-        let _ = Command::new("cargo").env_remove("CARGO_TARGET_DIR").current_dir(&tools_dir).args(&["run", "--release", "--bin", "gen", "seeds.txt"]).output();
+        let _ = Command::new("cargo")
+            .env_remove("CARGO_TARGET_DIR")
+            .current_dir(&tools_dir)
+            .args(&["run", "--release", "--bin", "gen", "seeds.txt"])
+            .output();
     }
     Ok("準備完了".to_string())
 }
 
 #[tauri::command]
-async fn run_test_case(contest_name: String, language: String, case_id: usize, time_limit: f64, memory_limit: usize, submission_id: String) -> Result<TestCaseResult, String> {
+async fn run_test_case(
+    contest_name: String,
+    language: String,
+    case_id: usize,
+    time_limit: f64,
+    memory_limit: usize,
+    submission_id: String,
+) -> Result<TestCaseResult, String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
     let tools_dir = find_tools_dir(&contest_dir);
     let exe_suffix = std::env::consts::EXE_SUFFIX;
 
-    let file_ext = if language == "cpp" { "cpp" } else if language == "rust" { "rs" } else { "py" };
+    let file_ext = if language == "cpp" {
+        "cpp"
+    } else if language == "rust" {
+        "rs"
+    } else {
+        "py"
+    };
     let src_path = contest_dir.join(format!("main.{}", file_ext));
     let exe_path = if language == "rust" {
-        contest_dir.join("rust_src").join("target").join("release").join(format!("solution{}", exe_suffix))
+        contest_dir
+            .join("rust_src")
+            .join("target")
+            .join("release")
+            .join(format!("solution{}", exe_suffix))
     } else {
         contest_dir.join(format!("a.out{}", exe_suffix))
     };
@@ -568,85 +769,211 @@ async fn run_test_case(contest_name: String, language: String, case_id: usize, t
     let out_file = sub_out_dir.join(format!("{:04}.txt", case_id));
     let err_file = sub_out_dir.join(format!("{:04}_err.txt", case_id));
 
-    if !in_file.exists() { return Ok(TestCaseResult { id: case_id, score: 0, status: "IE".to_string(), time: 0.0, error_msg: "入力ファイル生成エラー".to_string() }); }
+    if !in_file.exists() {
+        return Ok(TestCaseResult {
+            id: case_id,
+            score: 0,
+            status: "IE".to_string(),
+            time: 0.0,
+            error_msg: "入力ファイル生成エラー".to_string(),
+        });
+    }
 
-    let tester_bin = tools_dir.join("target").join("release").join(format!("tester{}", exe_suffix));
+    let tester_bin = tools_dir
+        .join("target")
+        .join("release")
+        .join(format!("tester{}", exe_suffix));
     let use_tester = tester_bin.exists();
 
-    let mut last_result = TestCaseResult { id: case_id, score: 0, status: "IE".to_string(), time: 0.0, error_msg: "Unknown".to_string() };
+    let mut last_result = TestCaseResult {
+        id: case_id,
+        score: 0,
+        status: "IE".to_string(),
+        time: 0.0,
+        error_msg: "Unknown".to_string(),
+    };
 
     for attempt in 1..=3 {
         #[cfg(unix)]
         let mut cmd = {
             let kb = memory_limit * 1024;
             let user_cmd = if language == "python" {
-                format!("ulimit -v {}; exec python3 \"{}\"", kb, src_path.to_str().unwrap())
+                format!(
+                    "ulimit -v {}; exec python3 \"{}\"",
+                    kb,
+                    src_path.to_str().unwrap()
+                )
             } else {
                 format!("ulimit -v {}; exec \"{}\"", kb, exe_path.to_str().unwrap())
             };
-            if use_tester { let mut c = Command::new(&tester_bin); c.arg("sh").arg("-c").arg(&user_cmd); c }
-            else { let mut c = Command::new("sh"); c.arg("-c").arg(&user_cmd); c }
+            if use_tester {
+                let mut c = Command::new(&tester_bin);
+                c.arg("sh").arg("-c").arg(&user_cmd);
+                c
+            } else {
+                let mut c = Command::new("sh");
+                c.arg("-c").arg(&user_cmd);
+                c
+            }
         };
 
         #[cfg(not(unix))]
         let mut cmd = {
             if language == "python" {
-                if use_tester { let mut c = Command::new(&tester_bin); c.arg("python3").arg(&src_path); c }
-                else { let mut c = Command::new("python3"); c.arg(&src_path); c }
+                if use_tester {
+                    let mut c = Command::new(&tester_bin);
+                    c.arg("python3").arg(&src_path);
+                    c
+                } else {
+                    let mut c = Command::new("python3");
+                    c.arg(&src_path);
+                    c
+                }
             } else {
-                if use_tester { let mut c = Command::new(&tester_bin); c.arg(&exe_path); c }
-                else { Command::new(&exe_path) }
+                if use_tester {
+                    let mut c = Command::new(&tester_bin);
+                    c.arg(&exe_path);
+                    c
+                } else {
+                    Command::new(&exe_path)
+                }
             }
         };
 
-        let input_file_handle = match fs::File::open(&in_file) { Ok(f) => f, Err(e) => return Ok(TestCaseResult { id: case_id, score: 0, status: "RE".to_string(), time: 0.0, error_msg: e.to_string() }) };
+        let input_file_handle = match fs::File::open(&in_file) {
+            Ok(f) => f,
+            Err(e) => {
+                return Ok(TestCaseResult {
+                    id: case_id,
+                    score: 0,
+                    status: "RE".to_string(),
+                    time: 0.0,
+                    error_msg: e.to_string(),
+                })
+            }
+        };
         let output_file_handle = fs::File::create(&out_file).unwrap();
         let error_file_handle = fs::File::create(&err_file).unwrap();
 
-        cmd.stdin(Stdio::from(input_file_handle)).stdout(Stdio::from(output_file_handle)).stderr(Stdio::from(error_file_handle));
+        cmd.stdin(Stdio::from(input_file_handle))
+            .stdout(Stdio::from(output_file_handle))
+            .stderr(Stdio::from(error_file_handle));
 
         let start_time = Instant::now();
-        let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => return Ok(TestCaseResult { id: case_id, score: 0, status: "RE".to_string(), time: 0.0, error_msg: e.to_string() }) };
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(TestCaseResult {
+                    id: case_id,
+                    score: 0,
+                    status: "RE".to_string(),
+                    time: 0.0,
+                    error_msg: e.to_string(),
+                })
+            }
+        };
 
         let mut is_tle = false;
         let mut exit_status_opt = None;
 
         loop {
             match child.try_wait() {
-                Ok(Some(exit_status)) => { exit_status_opt = Some(exit_status); break; }
+                Ok(Some(exit_status)) => {
+                    exit_status_opt = Some(exit_status);
+                    break;
+                }
                 Ok(None) => {
-                    if start_time.elapsed().as_secs_f64() > time_limit { let _ = child.kill(); let _ = child.wait(); is_tle = true; break; }
+                    if start_time.elapsed().as_secs_f64() > time_limit {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        is_tle = true;
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                Err(e) => { return Ok(TestCaseResult { id: case_id, score: 0, status: "IE".to_string(), time: start_time.elapsed().as_secs_f64(), error_msg: format!("監視エラー: {}", e) }); }
+                Err(e) => {
+                    return Ok(TestCaseResult {
+                        id: case_id,
+                        score: 0,
+                        status: "IE".to_string(),
+                        time: start_time.elapsed().as_secs_f64(),
+                        error_msg: format!("監視エラー: {}", e),
+                    });
+                }
             }
         }
 
         let exec_time = start_time.elapsed().as_secs_f64();
 
         if is_tle {
-            last_result = TestCaseResult { id: case_id, score: 0, status: "TLE".to_string(), time: exec_time, error_msg: if attempt < 3 { format!("TLE ({:.2}s) - {}回目の再ジャッジを実行中...", time_limit, attempt + 1) } else { format!("TLE ({:.2}s)", time_limit) } };
-            if attempt < 3 { continue; } else { break; }
+            last_result = TestCaseResult {
+                id: case_id,
+                score: 0,
+                status: "TLE".to_string(),
+                time: exec_time,
+                error_msg: if attempt < 3 {
+                    format!(
+                        "TLE ({:.2}s) - {}回目の再ジャッジを実行中...",
+                        time_limit,
+                        attempt + 1
+                    )
+                } else {
+                    format!("TLE ({:.2}s)", time_limit)
+                },
+            };
+            if attempt < 3 {
+                continue;
+            } else {
+                break;
+            }
         }
 
         let err_msg = fs::read_to_string(&err_file).unwrap_or_default();
         if let Some(exit_status) = exit_status_opt {
             if !exit_status.success() {
-                let is_mle = err_msg.contains("MemoryError") || err_msg.contains("bad allocation") || exit_status.code() == Some(137) || exit_status.code() == Some(139);
-                if !is_mle && err_msg.contains("Score =") { } else {
+                let is_mle = err_msg.contains("MemoryError")
+                    || err_msg.contains("bad allocation")
+                    || exit_status.code() == Some(137)
+                    || exit_status.code() == Some(139);
+                if !is_mle && err_msg.contains("Score =") {
+                } else {
                     let status = if is_mle { "MLE" } else { "RE" };
-                    last_result = TestCaseResult { id: case_id, score: 0, status: status.to_string(), time: exec_time, error_msg: format!("{}\n(Exit Code: {:?})", err_msg.trim(), exit_status.code()) };
+                    last_result = TestCaseResult {
+                        id: case_id,
+                        score: 0,
+                        status: status.to_string(),
+                        time: exec_time,
+                        error_msg: format!(
+                            "{}\n(Exit Code: {:?})",
+                            err_msg.trim(),
+                            exit_status.code()
+                        ),
+                    };
                     break;
                 }
             }
         }
 
-        let vis_bin = tools_dir.join("target").join("release").join(format!("vis{}", exe_suffix));
+        let vis_bin = tools_dir
+            .join("target")
+            .join("release")
+            .join(format!("vis{}", exe_suffix));
         let mut combined = err_msg.clone();
 
         if vis_bin.exists() {
-            if let Ok(vo) = Command::new(&vis_bin).current_dir(&tools_dir).args([in_file.to_str().unwrap(), out_file.to_str().unwrap()]).output() {
-                if vo.status.success() { combined = format!("{}\n{}\n{}", combined, String::from_utf8_lossy(&vo.stdout), String::from_utf8_lossy(&vo.stderr)); }
+            if let Ok(vo) = Command::new(&vis_bin)
+                .current_dir(&tools_dir)
+                .args([in_file.to_str().unwrap(), out_file.to_str().unwrap()])
+                .output()
+            {
+                if vo.status.success() {
+                    combined = format!(
+                        "{}\n{}\n{}",
+                        combined,
+                        String::from_utf8_lossy(&vo.stdout),
+                        String::from_utf8_lossy(&vo.stderr)
+                    );
+                }
             }
         }
 
@@ -657,9 +984,24 @@ async fn run_test_case(contest_name: String, language: String, case_id: usize, t
             score = num_str.parse::<i64>().unwrap_or(0);
         }
 
-        if score > 0 { last_result = TestCaseResult { id: case_id, score, status: "AC".to_string(), time: exec_time, error_msg: "".to_string() }; } 
-        else { last_result = TestCaseResult { id: case_id, score: 0, status: "WA".to_string(), time: exec_time, error_msg: combined.to_string() }; }
-        break; 
+        if score > 0 {
+            last_result = TestCaseResult {
+                id: case_id,
+                score,
+                status: "AC".to_string(),
+                time: exec_time,
+                error_msg: "".to_string(),
+            };
+        } else {
+            last_result = TestCaseResult {
+                id: case_id,
+                score: 0,
+                status: "WA".to_string(),
+                time: exec_time,
+                error_msg: combined.to_string(),
+            };
+        }
+        break;
     }
 
     Ok(last_result)
@@ -678,7 +1020,7 @@ fn resize_window(window: tauri::WebviewWindow, width: f64, height: f64) {
 async fn get_testcase_memos(contest_name: String) -> Result<HashMap<String, String>, String> {
     let base_dir = get_workspaces_dir();
     let memos_file = base_dir.join(&contest_name).join("memos.json");
-    
+
     if memos_file.exists() {
         let content = fs::read_to_string(memos_file).unwrap_or_else(|_| "{}".to_string());
         let memos: HashMap<String, String> = serde_json::from_str(&content).unwrap_or_default();
@@ -689,7 +1031,11 @@ async fn get_testcase_memos(contest_name: String) -> Result<HashMap<String, Stri
 }
 
 #[tauri::command]
-async fn save_testcase_memo(contest_name: String, case_id: usize, memo: String) -> Result<(), String> {
+async fn save_testcase_memo(
+    contest_name: String,
+    case_id: usize,
+    memo: String,
+) -> Result<(), String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
     let memos_file = contest_dir.join("memos.json");
@@ -723,7 +1069,10 @@ async fn get_testcase_favorites(contest_name: String) -> Result<Vec<usize>, Stri
 }
 
 #[tauri::command]
-async fn save_testcase_favorites(contest_name: String, favorites: Vec<usize>) -> Result<(), String> {
+async fn save_testcase_favorites(
+    contest_name: String,
+    favorites: Vec<usize>,
+) -> Result<(), String> {
     let base_dir = get_workspaces_dir();
     let file = base_dir.join(&contest_name).join("favorites.json");
     let json = serde_json::to_string_pretty(&favorites).map_err(|e| e.to_string())?;
@@ -771,11 +1120,11 @@ async fn get_contest_config(contest_name: String) -> Result<ContestConfig, Strin
 async fn save_contest_config(contest_name: String, config: ContestConfig) -> Result<(), String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
-    
+
     if !contest_dir.exists() {
         fs::create_dir_all(&contest_dir).map_err(|e| format!("ディレクトリ作成失敗: {}", e))?
     }
-    
+
     let config_file = contest_dir.join("config.json");
     let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
     fs::write(config_file, json).map_err(|e| e.to_string())?;
@@ -784,10 +1133,12 @@ async fn save_contest_config(contest_name: String, config: ContestConfig) -> Res
 }
 
 #[tauri::command]
-async fn get_testcase_variables(contest_name: String) -> Result<HashMap<usize, HashMap<String, f64>>, String> {
+async fn get_testcase_variables(
+    contest_name: String,
+) -> Result<HashMap<usize, HashMap<String, f64>>, String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
-    
+
     let config_file = contest_dir.join("config.json");
     let config: ContestConfig = if config_file.exists() {
         let content = fs::read_to_string(&config_file).unwrap_or_else(|_| "{}".to_string());
@@ -818,11 +1169,11 @@ async fn get_testcase_variables(contest_name: String) -> Result<HashMap<usize, H
                         if let Ok(file) = File::open(&path) {
                             let mut reader = BufReader::new(file);
                             let mut first_line = String::new();
-                            
+
                             if reader.read_line(&mut first_line).is_ok() {
                                 let values: Vec<&str> = first_line.split_whitespace().collect();
                                 let mut var_map = HashMap::new();
-                                
+
                                 for (i, name) in var_names.iter().enumerate() {
                                     if let Some(val_str) = values.get(i) {
                                         if let Ok(val) = val_str.parse::<f64>() {
@@ -846,7 +1197,7 @@ async fn get_testcase_variables(contest_name: String) -> Result<HashMap<usize, H
 async fn update_tools_from_zip(contest_name: String, zip_path: String) -> Result<(), String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
-    
+
     if !contest_dir.exists() {
         return Err("コンテストディレクトリが存在しません".to_string());
     }
@@ -856,10 +1207,16 @@ async fn update_tools_from_zip(contest_name: String, zip_path: String) -> Result
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-        let outpath = match file.enclosed_name() { Some(p) => contest_dir.join(p), None => continue };
-        if (*file.name()).ends_with('/') { fs::create_dir_all(&outpath).map_err(|e| e.to_string())?; } 
-        else {
-            if let Some(p) = outpath.parent() { fs::create_dir_all(p).map_err(|e| e.to_string())?; }
+        let outpath = match file.enclosed_name() {
+            Some(p) => contest_dir.join(p),
+            None => continue,
+        };
+        if (*file.name()).ends_with('/') {
+            fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
+        } else {
+            if let Some(p) = outpath.parent() {
+                fs::create_dir_all(p).map_err(|e| e.to_string())?;
+            }
             let mut outfile = fs::File::create(&outpath).map_err(|e| e.to_string())?;
             io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
         }
@@ -916,8 +1273,13 @@ fn main() {
         if let Ok(server) = tiny_http::Server::http("127.0.0.1:14234") {
             let base_dir = get_workspaces_dir();
             for request in server.incoming_requests() {
-                let url = request.url().split('?').next().unwrap().trim_start_matches('/');
-                
+                let url = request
+                    .url()
+                    .split('?')
+                    .next()
+                    .unwrap()
+                    .trim_start_matches('/');
+
                 // --- ↓ ここからプロキシ（身代わり）処理を追加 ↓ ---
                 if url.starts_with("proxy/") {
                     // 1. ローカルのURLをAtCoderの本来のURLに復元する
@@ -938,19 +1300,35 @@ fn main() {
                         // 3. JSファイルの中身に直接AtCoderのURLが書かれている場合、それもプロキシURLに書き換える
                         if target_url.ends_with(".js") {
                             if let Ok(js_text) = String::from_utf8(bytes.clone()) {
-                                let modified_js = js_text.replace("https://img.atcoder.jp/", "http://127.0.0.1:14234/proxy/");
+                                let modified_js = js_text.replace(
+                                    "https://img.atcoder.jp/",
+                                    "http://127.0.0.1:14234/proxy/",
+                                );
                                 bytes = modified_js.into_bytes();
                             }
                         }
 
                         // 4. ブラウザに「安全なローカルファイルですよ」と偽装して返す
                         let response = tiny_http::Response::from_data(bytes)
-                            .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
-                            .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap());
-                        
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Access-Control-Allow-Origin"[..],
+                                    &b"*"[..],
+                                )
+                                .unwrap(),
+                            )
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Content-Type"[..],
+                                    content_type.as_bytes(),
+                                )
+                                .unwrap(),
+                            );
+
                         let _ = request.respond(response);
                     } else {
-                        let _ = request.respond(tiny_http::Response::new_empty(tiny_http::StatusCode(404)));
+                        let _ = request
+                            .respond(tiny_http::Response::new_empty(tiny_http::StatusCode(404)));
                     }
                     continue;
                 }
@@ -961,18 +1339,48 @@ fn main() {
                 if file_path.exists() && file_path.is_file() {
                     if let Ok(file) = std::fs::File::open(&file_path) {
                         let mut response = tiny_http::Response::from_file(file);
-                        
+
                         if url.ends_with(".html") {
-                            response.add_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap());
-                            response.add_header(tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-store, no-cache, max-age=0"[..]).unwrap());
+                            response.add_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Content-Type"[..],
+                                    &b"text/html; charset=utf-8"[..],
+                                )
+                                .unwrap(),
+                            );
+                            response.add_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Cache-Control"[..],
+                                    &b"no-store, no-cache, max-age=0"[..],
+                                )
+                                .unwrap(),
+                            );
                         } else if url.ends_with(".js") {
-                            response.add_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/javascript; charset=utf-8"[..]).unwrap());
+                            response.add_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Content-Type"[..],
+                                    &b"application/javascript; charset=utf-8"[..],
+                                )
+                                .unwrap(),
+                            );
                         } else if url.ends_with(".wasm") {
-                            response.add_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/wasm"[..]).unwrap());
+                            response.add_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Content-Type"[..],
+                                    &b"application/wasm"[..],
+                                )
+                                .unwrap(),
+                            );
                         } else if url.ends_with(".css") {
-                            response.add_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/css; charset=utf-8"[..]).unwrap());
+                            response.add_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Content-Type"[..],
+                                    &b"text/css; charset=utf-8"[..],
+                                )
+                                .unwrap(),
+                            );
                         }
-                        
+
                         let _ = request.respond(response);
                         continue;
                     }
