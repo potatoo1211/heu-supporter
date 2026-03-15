@@ -7,9 +7,6 @@ use std::io::{self, Write, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
-use std::thread;
-use std::time::Duration;
-use tauri::Manager;
 
 #[derive(Serialize)]
 struct TestCaseResult {
@@ -217,6 +214,28 @@ async fn delete_contest(name: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn reset_visualizer_cache(contest_name: String) -> Result<(), String> {
+    let base_dir = get_workspaces_dir();
+    let contest_dir = base_dir.join(&contest_name);
+    let tools_dir = find_tools_dir(&contest_dir);
+    let web_vis_dir = tools_dir.join("web_vis");
+    if web_vis_dir.exists() {
+        fs::remove_dir_all(&web_vis_dir).map_err(|e| format!("キャッシュ削除失敗: {}", e))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_submission_dir(contest_name: String, submission_id: String) -> Result<(), String> {
+    let base_dir = get_workspaces_dir();
+    let sub_out_dir = base_dir.join(&contest_name).join("out").join(&submission_id);
+    if sub_out_dir.exists() {
+        fs::remove_dir_all(&sub_out_dir).map_err(|e| format!("削除失敗: {}", e))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn save_submissions(contest_name: String, data: String) -> Result<(), String> {
     let base_dir = get_workspaces_dir();
     let file_path = base_dir.join(&contest_name).join("submissions.json");
@@ -302,13 +321,6 @@ async fn get_visualizer_data(contest_name: String, case_id: usize, submission_id
         if !css_path.exists() { if let Ok(resp) = reqwest::get(format!("{}style.css", base_url)).await { if let Ok(b) = resp.bytes().await { let _ = fs::write(&css_path, b); } } }
 
         // HTML本体も初回のみダウンロードして保存。2回目以降は超高速＆完全オフライン！
-        // 古いキャッシュ（クラッター除去前）が残っていれば削除して再取得
-        if template_html_path.exists() {
-            let cached = fs::read_to_string(&template_html_path).unwrap_or_default();
-            if cached.contains("<details") || cached.contains("問題文はこちら") || cached.contains("使い方") {
-                let _ = fs::remove_file(&template_html_path);
-            }
-        }
         let mut base_html_text = String::new();
         if template_html_path.exists() {
             base_html_text = fs::read_to_string(&template_html_path).unwrap_or_default();
@@ -329,7 +341,7 @@ async fn get_visualizer_data(contest_name: String, case_id: usize, submission_id
 
         if !base_html_text.is_empty() {
             // HTMLの中にあるAtCoderの直リンクを、すべてローカルのプロキシ経由にすり替える
-            let mut base_html_text = base_html_text.replace("https://img.atcoder.jp/", "http://127.0.0.1:14234/proxy/");
+            let base_html_text = base_html_text.replace("https://img.atcoder.jp/", "http://127.0.0.1:14234/proxy/");
             
             let safe_in = input_text.replace("</script>", "<\\/script>");
             let safe_out = output_text.replace("</script>", "<\\/script>");
@@ -387,7 +399,7 @@ window.addEventListener('message', (event) => {{
             fs::write(&index_html_path, final_html).unwrap_or_default();
 
             let relative_tools = tools_dir.strip_prefix(&base_dir).unwrap();
-            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            let _timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
             local_url = Some(format!("http://127.0.0.1:14234/{}/web_vis/index.html", relative_tools.to_string_lossy().replace("\\", "/")));
         }
     }
@@ -697,6 +709,28 @@ async fn save_testcase_memo(contest_name: String, case_id: usize, memo: String) 
     Ok(())
 }
 
+#[tauri::command]
+async fn get_testcase_favorites(contest_name: String) -> Result<Vec<usize>, String> {
+    let base_dir = get_workspaces_dir();
+    let file = base_dir.join(&contest_name).join("favorites.json");
+    if file.exists() {
+        let content = fs::read_to_string(file).unwrap_or_else(|_| "[]".to_string());
+        let favs: Vec<usize> = serde_json::from_str(&content).unwrap_or_default();
+        Ok(favs)
+    } else {
+        Ok(vec![])
+    }
+}
+
+#[tauri::command]
+async fn save_testcase_favorites(contest_name: String, favorites: Vec<usize>) -> Result<(), String> {
+    let base_dir = get_workspaces_dir();
+    let file = base_dir.join(&contest_name).join("favorites.json");
+    let json = serde_json::to_string_pretty(&favorites).map_err(|e| e.to_string())?;
+    fs::write(file, json).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct ContestConfig {
     name: String,
@@ -951,6 +985,7 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             get_visualizer_data,
             get_contests,
@@ -958,12 +993,16 @@ fn main() {
             delete_contest,
             save_submissions,
             load_submissions,
+            delete_submission_dir,
+            reset_visualizer_cache,
             generate_inputs,
             setup_submission,
             run_test_case,
             resize_window,
             get_testcase_memos,
             save_testcase_memo,
+            get_testcase_favorites,
+            save_testcase_favorites,
             get_contest_config,
             save_contest_config,
             get_testcase_variables,

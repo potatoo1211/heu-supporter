@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import Editor from '@monaco-editor/react';
-import { Code2, Play, LayoutList, Settings, Plus, Folder, ArrowLeft, Loader2, CheckCircle2, AlertCircle, Trophy, Edit2, Clock, Trash2, FileCode2, Eye, ExternalLink, BarChart2, Copy, Check } from 'lucide-react';
+import { Code2, Play, LayoutList, Settings, Plus, Folder, ArrowLeft, Loader2, CheckCircle2, AlertCircle, Trophy, Edit2, Clock, Trash2, FileCode2, Eye, ExternalLink, BarChart2, Copy, Check, Star } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
+import { readText } from '@tauri-apps/plugin-clipboard-manager';
 
 type TestCaseResult = { id: number; score: number; status: string; time: number; error_msg: string; };
 
@@ -109,6 +110,37 @@ const ConfirmDialog = ({ message, subMessage, onConfirm, onCancel, confirmLabel 
 interface HoverInfo { score: number; id: number; label: string; px: number; py: number; subId?: string }
 interface ScatterPoint { x: number; y: number; id: number }
 interface ScatterSeries { subId: string; subName: string; data: ScatterPoint[] }
+
+// ページネーションコンポーネント
+const Pagination = ({ page, total, pageSize, onPage, onPageSize }: {
+  page: number; total: number; pageSize: number;
+  onPage: (p: number) => void; onPageSize: (s: number) => void;
+}) => {
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  if (total === 0) return null;
+  const from = (page - 1) * pageSize + 1;
+  const to = Math.min(page * pageSize, total);
+  return (
+    <div className="flex items-center justify-between py-2 px-1 text-sm text-gray-600 select-none">
+      <span className="text-xs text-gray-400">{from}–{to} / {total} 件</span>
+      <div className="flex items-center gap-2">
+        <select value={pageSize} onChange={e => { onPageSize(Number(e.target.value)); onPage(1); }}
+          className="border rounded px-1.5 py-1 text-xs bg-white">
+          {[20, 50, 100].map(s => <option key={s} value={s}>{s}件</option>)}
+        </select>
+        <button onClick={() => onPage(1)} disabled={page === 1}
+          className="px-1.5 py-1 rounded disabled:opacity-30 hover:bg-gray-100 transition-colors font-bold">«</button>
+        <button onClick={() => onPage(page - 1)} disabled={page === 1}
+          className="px-2 py-1 rounded disabled:opacity-30 hover:bg-gray-100 transition-colors font-bold">‹</button>
+        <span className="text-xs font-bold">{page} / {totalPages}</span>
+        <button onClick={() => onPage(page + 1)} disabled={page === totalPages}
+          className="px-2 py-1 rounded disabled:opacity-30 hover:bg-gray-100 transition-colors font-bold">›</button>
+        <button onClick={() => onPage(totalPages)} disabled={page === totalPages}
+          className="px-1.5 py-1 rounded disabled:opacity-30 hover:bg-gray-100 transition-colors font-bold">»</button>
+      </div>
+    </div>
+  );
+};
 
 const SvgScatterPlot = React.memo(({
   plotData, yDomain, xLabel, subColorMap, onHover, onLeave, onClickPoint, hoveredId, activeVisId,
@@ -502,6 +534,7 @@ const formatTimestamp = (timestamp: number) => {
 
 function App() {
   const visIframeRef = useRef<HTMLIFrameElement>(null);
+  const editorRef = useRef<any>(null);
   const [contests, setContests] = useState<ContestItem[]>([]);
   const [sortType, setSortType] = useState<'date' | 'name'>('date');
   const [currentContest, setCurrentContest] = useState<string | null>(null);
@@ -527,6 +560,9 @@ function App() {
   };
 
   const [isProcessing, setIsProcessing] = useState(false);
+  const cancelRef = useRef(false);
+  const runningSubIdRef = useRef<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const [status, setStatus] = useState<{ type: 'info' | 'success' | 'error', message: string } | null>(null);
 
   const [submissionsMap, setSubmissionsMap] = useState<Record<string, Submission[]>>({});
@@ -543,6 +579,17 @@ function App() {
   useEffect(() => { setVisDataSynced(null); setCurrentVisSubId(null); }, [activeTab]);
 
   const [memos, setMemos] = useState<Record<string, string>>({});
+  const [favorites, setFavorites] = useState<Set<number>>(new Set());
+  const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
+
+  const toggleFavorite = async (caseId: number) => {
+    if (!currentContest) return;
+    const next = new Set(favorites);
+    if (next.has(caseId)) { next.delete(caseId); } else { next.add(caseId); }
+    setFavorites(next);
+    try { await invoke('save_testcase_favorites', { contestName: currentContest, favorites: Array.from(next) }); }
+    catch (e) { console.error(e); }
+  };
 
   const [config, setConfig] = useState<ContestConfig | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -558,6 +605,13 @@ function App() {
   // テストケースごとの入出力展開状態
   const [expandedCaseIO, setExpandedCaseIO] = useState<Record<number, { input: string; output: string; stderr: string } | 'loading'>>({});
 
+  // ページネーション
+  const [subPage, setSubPage] = useState(1);
+  const [subPageSize, setSubPageSize] = useState(20);
+  const [tcPage, setTcPage] = useState(1);
+  const [tcPageSize, setTcPageSize] = useState(50);
+  const [caseCountFilter, setCaseCountFilter] = useState<Set<number>>(new Set());
+
   // ★ 追加: 統計タブ用のState
   const [selectedForStats, setSelectedForStats] = useState<Set<string>>(new Set());
   const [varFilters, setVarFilters] = useState<Record<string, { min: number | '', max: number | '' }>>({});
@@ -567,6 +621,7 @@ function App() {
   const [currentVisSubId, setCurrentVisSubId] = useState<string | null>(null);
   // X軸モード: 'auto'=変数ごと | 'seed'=seed軸折れ線
   const [statsXAxisMode, setStatsXAxisMode] = useState<'auto' | 'seed'>('auto');
+  const [seedRange, setSeedRange] = useState<{ min: number | ''; max: number | '' }>({ min: '', max: '' });
   // クリック時に最新のホバー点を確実に参照するための ref（state は非同期なので不確実）
   const hoveredPointRef = React.useRef<{ id: number } | null>(null);
 
@@ -590,6 +645,7 @@ function App() {
   // 提出の選択が変わったら展開中のIOをリセット
   useEffect(() => {
     setExpandedCaseIO({});
+    setTcPage(1);
   }, [selectedSubId]);
 
   // submissions を先に計算
@@ -630,17 +686,26 @@ function App() {
   const sortedSubmissions = useMemo(() => {
     if (!submissions) return [];
 
-    // 各提出に「合計相対スコア」を付与
     const mapped = submissions.map(sub => {
-      const totalRelScore = sub.testCases?.reduce((acc, tc) => acc + calcRelativeScore(tc.score, bestScores[tc.id]), 0) || 0;
-      return { ...sub, totalRelScore };
+      const cases = sub.testCases ?? [];
+      const totalRelScore = cases.reduce((acc, tc) => acc + calcRelativeScore(tc.score, bestScores[tc.id]), 0);
+      // ソート用: テストケース数で割った平均（件数が違っても公平に比較できる）
+      const n = cases.length || 1;
+      const avgScore = sub.totalScore / n;
+      const avgRelScore = totalRelScore / n;
+      return { ...sub, totalRelScore, _avgScore: avgScore, _avgRelScore: avgRelScore };
     });
 
-    // 指定されたキーでソート
     return mapped.sort((a, b) => {
-      let valA: any = a[submissionSort.key as keyof typeof a];
-      let valB: any = b[submissionSort.key as keyof typeof b];
-
+      let valA: number, valB: number;
+      if (submissionSort.key === 'totalScore') {
+        valA = a._avgScore; valB = b._avgScore;
+      } else if (submissionSort.key === 'totalRelScore') {
+        valA = a._avgRelScore; valB = b._avgRelScore;
+      } else {
+        valA = a[submissionSort.key as keyof typeof a] as any;
+        valB = b[submissionSort.key as keyof typeof b] as any;
+      }
       if (valA < valB) return submissionSort.order === 'asc' ? -1 : 1;
       if (valA > valB) return submissionSort.order === 'asc' ? 1 : -1;
       return 0;
@@ -652,12 +717,14 @@ function App() {
     setSubmissionSort(prev => ({
       key, order: prev.key === key && prev.order === 'desc' ? 'asc' : 'desc'
     }));
+    setSubPage(1);
   };
 
   const handleTestCaseSort = (key: string) => {
     setTestCaseSort(prev => ({
       key, order: prev.key === key && prev.order === 'desc' ? 'asc' : 'desc'
     }));
+    setTcPage(1);
   };
 
   useEffect(() => { loadContests(); }, []);
@@ -668,6 +735,9 @@ function App() {
         .catch(e => console.error("設定読み込みエラー:", e));
       invoke<Record<string, string>>('get_testcase_memos', { contestName: currentContest })
         .then(data => setMemos(data))
+        .catch(console.error);
+      invoke<number[]>('get_testcase_favorites', { contestName: currentContest })
+        .then(data => setFavorites(new Set(data)))
         .catch(console.error);
     } else {
       setConfig(null);
@@ -764,7 +834,7 @@ function App() {
 
   const showStatus = (type: 'info' | 'success' | 'error', message: string) => {
     setStatus({ type, message });
-    if (type === 'success') setTimeout(() => setStatus(null), 5000);
+    if (type === 'success' || type === 'info') setTimeout(() => setStatus(null), 5000);
   };
 
   const loadContests = async () => {
@@ -822,11 +892,15 @@ function App() {
 
   const handleDeleteSubmission = (e: React.MouseEvent, subId: string) => {
     e.stopPropagation();
+    const isRunning = runningSubIdRef.current === subId;
     showConfirm(
       'この提出を削除しますか？',
-      undefined,
+      isRunning ? '現在実行中です。キャンセルしてから削除します。' : undefined,
       () => {
         setConfirmDialog(null);
+        if (isRunning) cancelRef.current = true;
+        // バックグラウンドでディレクトリ削除（失敗しても無視）
+        invoke('delete_submission_dir', { contestName: currentContest!, submissionId: subId }).catch(console.error);
         setSubmissionsMap(prev => {
           const list = prev[currentContest!] || [];
           const newList = list.filter(s => s.id !== subId);
@@ -852,12 +926,15 @@ function App() {
   const handleSubmit = async () => {
     if (!currentContest) return;
     setIsProcessing(true);
+    cancelRef.current = false;
+    setSubmitError(null);
     showStatus('info', 'コンパイル・準備中...');
 
     try {
       await invoke('setup_submission', { contestName: currentContest, code: code, language: language, testCases: testCases });
 
       const subId = Date.now().toString();
+      runningSubIdRef.current = subId;
       const newSub: Submission = {
         id: subId, timestamp: Date.now(),
         time: new Date().toLocaleString('ja-JP', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }),
@@ -894,6 +971,7 @@ function App() {
 
       const runQueue = async (queue: number[]) => {
         while (queue.length > 0) {
+          if (cancelRef.current) break;
           const i = queue.shift();
           if (i === undefined) break;
 
@@ -916,12 +994,13 @@ function App() {
       for (let i = 0; i < concurrency; i++) { workers.push(runQueue(queue)); }
       await Promise.all(workers);
 
+      const cancelled = cancelRef.current;
       const hasIE = resultsArr.some(r => r.status === 'IE');
       const hasMLE = resultsArr.some(r => r.status === 'MLE');
       const hasTLE = resultsArr.some(r => r.status === 'TLE');
       const hasRE = resultsArr.some(r => r.status === 'RE');
       const hasWA = resultsArr.some(r => r.status === 'WA');
-      const finalStatus = hasIE ? 'IE' : hasMLE ? 'MLE' : hasTLE ? 'TLE' : hasRE ? 'RE' : hasWA ? 'WA' : 'AC';
+      const finalStatus = cancelled ? `Cancelled (${completedCases}/${testCases})` : hasIE ? 'IE' : hasMLE ? 'MLE' : hasTLE ? 'TLE' : hasRE ? 'RE' : hasWA ? 'WA' : 'AC';
 
       setSubmissionsMap(prev => {
         const list = prev[currentContest] || [];
@@ -929,10 +1008,16 @@ function App() {
         saveSubmissions(currentContest, newList);
         return { ...prev, [currentContest]: newList };
       });
-      showStatus('success', 'すべてのテストケースの実行が完了しました！');
+      if (cancelled) { setStatus(null); showStatus('info', `キャンセルしました（${completedCases}件完了）`); }
+      else { showStatus('success', 'すべてのテストケースの実行が完了しました！'); }
 
-    } catch (error) { showStatus('error', String(error)); }
-    finally { setIsProcessing(false); }
+    } catch (error) {
+      setStatus(null);
+      setSubmitError(String(error));
+      setActiveTab('submit');
+      showStatus('error', 'コンパイルエラーが発生しました');
+    }
+    finally { setIsProcessing(false); cancelRef.current = false; runningSubIdRef.current = null; }
   };
 
   const updateSubName = (id: string, newName: string) => {
@@ -1163,12 +1248,12 @@ function App() {
         {/* 左側エリア（提出結果・エディタ）— 独立スクロール */}
         <div className={`flex-1 min-w-0 overflow-y-auto overflow-x-hidden p-4 ${visData ? '' : 'max-w-7xl mx-auto w-full'}`}>
           {activeTab === 'submit' && (
+            <>
             <div className="bg-white border border-gray-300 rounded-lg shadow-sm flex flex-col h-[calc(100vh-140px)] min-h-[500px]">
               <div className="p-3 border-b border-gray-200 flex gap-4 items-center bg-gray-50 rounded-t-lg overflow-x-auto">
                 <select value={language} onChange={(e) => {
                   const lang = e.target.value;
                   setLanguage(lang);
-                  // コードが初期状態に近ければテンプレートに切り替える
                   const isTemplate = Object.values(DEFAULT_CODE).some(t => code.trim() === t.trim());
                   if (isTemplate) setCode(DEFAULT_CODE[lang] ?? '');
                 }} className="border rounded p-1.5 text-sm font-bold bg-white">
@@ -1189,27 +1274,117 @@ function App() {
                   <span className="text-sm font-bold">メモリ(MB):</span>
                   <input type="number" step="128" min="128" value={memoryLimit} onChange={(e) => setMemoryLimit(Number(e.target.value))} className="border rounded p-1.5 w-20 text-sm bg-white" />
                 </div>
-                <button disabled={isProcessing} onClick={handleSubmit} className="ml-auto bg-blue-600 hover:bg-blue-700 text-white font-bold py-1.5 px-6 rounded shadow flex items-center gap-2 disabled:opacity-50 transition-all whitespace-nowrap">
-                  {isProcessing ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} fill="currentColor" />}
-                  コンパイルして実行
-                </button>
+                <div className="ml-auto flex items-center gap-2">
+                  <CopyButton text={code} className="py-1.5 px-3 text-sm" />
+                  <button
+                    onClick={async () => {
+                      try {
+                        const text = await readText();
+                        if (text && editorRef.current) {
+                          const selections = editorRef.current.getSelections() ?? [];
+                          const edits = selections.map((sel: any) => ({ range: sel, text, forceMoveMarkers: true }));
+                          editorRef.current.executeEdits('clipboard-paste', edits);
+                          editorRef.current.focus();
+                        }
+                      } catch (err) { console.error('貼り付け失敗:', err); }
+                    }}
+                    className="flex items-center gap-1 px-3 py-1.5 rounded text-sm font-bold bg-gray-100 text-gray-600 hover:bg-gray-200 transition-colors whitespace-nowrap"
+                    title="クリップボードから貼り付け (Ctrl+V)"
+                  >
+                    <Copy size={13} /> 貼り付け
+                  </button>
+                  <button disabled={isProcessing} onClick={handleSubmit} className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold py-1.5 px-6 rounded shadow flex items-center gap-2 transition-all whitespace-nowrap">
+                    {isProcessing ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} fill="currentColor" />}
+                    コンパイルして実行
+                  </button>
+                  {isProcessing && (
+                    <button onClick={() => { cancelRef.current = true; }} className="bg-red-500 hover:bg-red-600 text-white font-bold py-1.5 px-4 rounded shadow flex items-center gap-2 transition-all whitespace-nowrap">
+                      ✕ キャンセル
+                    </button>
+                  )}
+                </div>
               </div>
               <div className="flex-1 relative">
-                <Editor height="100%" language={language === 'python' ? 'python' : language === 'rust' ? 'rust' : 'cpp'} theme="vs-light" value={code} onChange={(v) => setCode(v || '')} options={{ fontSize: 14, minimap: { enabled: false } }} />
+                <Editor height="100%" language={language === 'python' ? 'python' : language === 'rust' ? 'rust' : 'cpp'} theme="vs-light" value={code} onChange={(v) => setCode(v || '')}
+                  onMount={(editor, monaco) => {
+                    editorRef.current = editor;
+                    // Ctrl+V / Cmd+V を Tauri ネイティブクリップボード経由に上書き
+                    editor.onKeyDown(async (e: any) => {
+                      if ((e.ctrlKey || e.metaKey) && e.keyCode === monaco.KeyCode.KeyV && !e.shiftKey) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        try {
+                          const text = await readText();
+                          if (text) {
+                            const selections = editor.getSelections() ?? [];
+                            const edits = selections.map((sel: any) => ({ range: sel, text, forceMoveMarkers: true }));
+                            editor.executeEdits('clipboard-paste', edits);
+                          }
+                        } catch (err) { console.error('Ctrl+V 貼り付け失敗:', err); }
+                      }
+                    });
+                  }}
+                  options={{ fontSize: 14, minimap: { enabled: false } }} />
                 {isProcessing && <div className="absolute inset-0 bg-white/50 backdrop-blur-sm z-10 flex items-center justify-center"><Loader2 size={48} className="animate-spin text-blue-600" /></div>}
               </div>
             </div>
+            {submitError && (
+              <div className="mt-3 bg-white border border-red-300 rounded-lg shadow-sm overflow-hidden">
+                <div className="flex items-center justify-between px-4 py-2 bg-red-50 border-b border-red-200">
+                  <span className="text-sm font-bold text-red-700 flex items-center gap-2">
+                    <AlertCircle size={16} /> コンパイルエラー詳細
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <CopyButton text={submitError} />
+                    <button onClick={() => setSubmitError(null)} className="text-red-400 hover:text-red-600 text-xs font-bold px-2 py-1">✕ 閉じる</button>
+                  </div>
+                </div>
+                <pre className="text-xs font-mono text-gray-800 p-4 max-h-64 overflow-auto whitespace-pre-wrap break-all">{submitError}</pre>
+              </div>
+            )}
+          </>
           )}
 
           {activeTab === 'submissions' && (
             <div className="bg-white border border-gray-300 rounded-lg shadow-sm p-6 min-h-[500px]">
               {!selectedSubId && (
                 <>
-                  <h2 className="text-2xl font-bold flex items-center gap-2 mb-6 border-b pb-4"><LayoutList className="text-blue-500" /> 提出一覧</h2>
+                  <h2 className="text-2xl font-bold flex items-center gap-2 mb-4 border-b pb-4"><LayoutList className="text-blue-500" /> 提出一覧</h2>
                   {sortedSubmissions.length === 0 ? (
                     <p className="text-gray-500 text-center py-10">まだ提出がありません。</p>
-                  ) : (
-                    <div className="overflow-x-auto">
+                  ) : (() => {
+                    // ケース数の種類を収集
+                    const caseCountSet = new Set(sortedSubmissions.map((s: any) => s.testCases?.length ?? 0));
+                    const caseCountOptions = [...caseCountSet].sort((a, b) => a - b);
+                    const filtered = caseCountFilter.size === 0
+                      ? sortedSubmissions
+                      : sortedSubmissions.filter((s: any) => caseCountFilter.has(s.testCases?.length ?? 0));
+                    return (
+                    <>
+                      {caseCountOptions.length > 1 && (
+                        <div className="flex items-center gap-2 mb-3 flex-wrap">
+                          <span className="text-xs font-bold text-gray-500">ケース数:</span>
+                          {caseCountOptions.map(n => {
+                            const active = caseCountFilter.has(n);
+                            return (
+                              <button key={n} onClick={() => {
+                                const next = new Set(caseCountFilter);
+                                active ? next.delete(n) : next.add(n);
+                                setCaseCountFilter(next);
+                                setSubPage(1);
+                              }} className={`px-2.5 py-0.5 rounded-full text-xs font-bold border transition-colors ${active ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400'}`}>
+                                {n}件
+                              </button>
+                            );
+                          })}
+                          {caseCountFilter.size > 0 && (
+                            <button onClick={() => { setCaseCountFilter(new Set()); setSubPage(1); }} className="text-xs text-gray-400 hover:text-red-500 transition-colors">解除</button>
+                          )}
+                        </div>
+                      )}
+                      <Pagination page={subPage} total={filtered.length} pageSize={subPageSize}
+                        onPage={setSubPage} onPageSize={setSubPageSize} />
+                      <div className="overflow-x-auto">
                       <table className="w-full text-left border-collapse whitespace-nowrap">
                         <thead>
                           <tr className="bg-gray-100 border-b-2 border-gray-300 text-sm select-none">
@@ -1225,7 +1400,7 @@ function App() {
                           </tr>
                         </thead>
                         <tbody>
-                          {sortedSubmissions.map((sub: any) => (
+                          {filtered.slice((subPage - 1) * subPageSize, subPage * subPageSize).map((sub: any) => (
                             <tr key={sub.id} className="border-b hover:bg-gray-50 transition-colors">
                               <td className="p-3 text-sm text-gray-600">{sub.time}</td>
                               <td className="p-3">
@@ -1248,8 +1423,12 @@ function App() {
                           ))}
                         </tbody>
                       </table>
-                    </div>
-                  )}
+                      </div>
+                      <Pagination page={subPage} total={filtered.length} pageSize={subPageSize}
+                        onPage={setSubPage} onPageSize={setSubPageSize} />
+                    </>
+                    );
+                  })()}
                 </>
               )}
 
@@ -1286,13 +1465,14 @@ function App() {
                   </div>
 
                   {detailTab === 'results' ? (
-                    <div className="overflow-x-auto">
+                    <div>
                       {(() => {
-                        const sortedCases = [...(selectedSub.testCases || [])].sort((a, b) => {
+                        const sortedCases = [...(selectedSub.testCases || [])]
+                          .filter(r => !showFavoritesOnly || favorites.has(r.id))
+                          .sort((a, b) => {
                           let valA = a[testCaseSort.key as keyof typeof a];
                           let valB = b[testCaseSort.key as keyof typeof b];
 
-                          // 相対スコアでのソート対応
                           if (testCaseSort.key === 'relScore') {
                             valA = calcRelativeScore(a.score, bestScores[a.id]);
                             valB = calcRelativeScore(b.score, bestScores[b.id]);
@@ -1302,11 +1482,23 @@ function App() {
                           if (valA > valB) return testCaseSort.order === 'asc' ? 1 : -1;
                           return 0;
                         });
+                        const pagedCases = sortedCases.slice((tcPage - 1) * tcPageSize, tcPage * tcPageSize);
 
                         return (
+                          <>
+                            <Pagination page={tcPage} total={sortedCases.length} pageSize={tcPageSize}
+                              onPage={setTcPage} onPageSize={setTcPageSize} />
+                          <div className="overflow-x-auto">
                           <table className="w-full text-left border-collapse whitespace-nowrap">
                             <thead>
                               <tr className="bg-gray-100 border-b-2 border-gray-300">
+                                <th className="p-3 font-bold w-8 text-center">
+                                  <button onClick={() => { setShowFavoritesOnly(v => !v); setTcPage(1); }}
+                                    title={showFavoritesOnly ? 'すべて表示' : 'お気に入りのみ'}
+                                    className={`transition-colors ${showFavoritesOnly ? 'text-yellow-400' : 'text-gray-300 hover:text-yellow-400'}`}>
+                                    <Star size={18} fill={showFavoritesOnly ? 'currentColor' : 'none'} />
+                                  </button>
+                                </th>
                                 <th className="p-3 font-bold w-20 text-center cursor-pointer hover:bg-gray-200 transition-colors" onClick={() => handleTestCaseSort('id')}>Case {testCaseSort.key === 'id' && (testCaseSort.order === 'asc' ? '↑' : '↓')}</th>
                                 <th className="p-3 font-bold w-24 text-center cursor-pointer hover:bg-gray-200 transition-colors" onClick={() => handleTestCaseSort('status')}>Status {testCaseSort.key === 'status' && (testCaseSort.order === 'asc' ? '↑' : '↓')}</th>
                                 <th className="p-3 font-bold w-24 text-right cursor-pointer hover:bg-gray-200 transition-colors" onClick={() => handleTestCaseSort('time')}>Time {testCaseSort.key === 'time' && (testCaseSort.order === 'asc' ? '↑' : '↓')}</th>
@@ -1318,11 +1510,18 @@ function App() {
                               </tr>
                             </thead>
                             <tbody>
-                              {sortedCases.map((r) => {
+                              {pagedCases.map((r) => {
                                 const relScore = calcRelativeScore(r.score, bestScores[r.id]);
                                 return (
                                   <React.Fragment key={r.id}>
                                     <tr className={`border-b hover:bg-gray-50 ${visData && r.id === Number(visData.input.match(/Case: (\d+)/)?.[1] || r.id) ? 'bg-blue-50' : ''}`}>
+                                      <td className="p-3 text-center">
+                                        <button onClick={() => toggleFavorite(r.id)}
+                                          className={`transition-colors ${favorites.has(r.id) ? 'text-yellow-400' : 'text-gray-200 hover:text-yellow-300'}`}
+                                          title={favorites.has(r.id) ? 'お気に入り解除' : 'お気に入りに追加'}>
+                                          <Star size={18} fill={favorites.has(r.id) ? 'currentColor' : 'none'} />
+                                        </button>
+                                      </td>
                                       <td className="p-3 font-mono text-center text-gray-500">{String(r.id).padStart(4, '0')}</td>
                                       <td className="p-3 text-center">{getStatusBadge(r.status)}</td>
                                       <td className="p-3 font-mono text-right text-gray-600">{r.time.toFixed(3)}s</td>
@@ -1353,7 +1552,7 @@ function App() {
                                     </tr>
                                     {expandedCaseIO[r.id] && expandedCaseIO[r.id] !== 'loading' && (
                                       <tr className="bg-gray-50 border-b">
-                                        <td colSpan={8} className="px-4 py-3">
+                                        <td colSpan={9} className="px-4 py-3">
                                           {(() => {
                                             const io = expandedCaseIO[r.id] as { input: string; output: string; stderr: string };
                                             const hasErr = !!io.stderr.trim();
@@ -1393,6 +1592,10 @@ function App() {
                               })}
                             </tbody>
                           </table>
+                          </div>
+                            <Pagination page={tcPage} total={sortedCases.length} pageSize={tcPageSize}
+                              onPage={setTcPage} onPageSize={setTcPageSize} />
+                          </>
                         );
                       })()}
                     </div>
@@ -1513,6 +1716,32 @@ function App() {
                           >seed</button>
                         </div>
                       </div>
+                      {statsXAxisMode === 'seed' && (
+                        <>
+                          <h3 className="font-bold text-gray-700 border-b pb-2 pt-1">seedフィルター</h3>
+                          <div className="space-y-1">
+                            <label className="text-xs font-bold text-gray-500 uppercase tracking-wide block">開始 seed</label>
+                            <input type="number" min="0" placeholder="0" className="w-full border p-1.5 text-sm rounded"
+                              value={seedRange.min}
+                              onChange={e => setSeedRange(r => ({ ...r, min: e.target.value ? Number(e.target.value) : '' }))} />
+                          </div>
+                          <div className="space-y-1">
+                            <label className="text-xs font-bold text-gray-500 uppercase tracking-wide block">終了 seed</label>
+                            <input type="number" min="0" placeholder="上限なし" className="w-full border p-1.5 text-sm rounded"
+                              value={seedRange.max}
+                              onChange={e => setSeedRange(r => ({ ...r, max: e.target.value ? Number(e.target.value) : '' }))} />
+                          </div>
+                          <div className="space-y-1">
+                            <label className="text-xs font-bold text-gray-500 uppercase tracking-wide block">お気に入りのみ</label>
+                            <label className="flex items-center gap-2 cursor-pointer">
+                              <input type="checkbox" checked={showFavoritesOnly}
+                                onChange={e => setShowFavoritesOnly(e.target.checked)}
+                                className="w-4 h-4 text-yellow-400" />
+                              <span className="text-sm text-gray-600 flex items-center gap-1"><Star size={13} className="text-yellow-400" fill="currentColor" /> お気に入りに絞る</span>
+                            </label>
+                          </div>
+                        </>
+                      )}
                       {statsXAxisMode === 'auto' && (
                         <>
                           <h3 className="font-bold text-gray-700 border-b pb-2 pt-1">変数フィルター</h3>
@@ -1548,11 +1777,18 @@ function App() {
 
                         let globalYMin = Infinity, globalYMax = -Infinity;
                         const lineSeries: SeedLineSeries[] = compareSubmissions.map(sub => {
-                          const data = (sub.testCases ?? []).map((tc: any) => {
-                            if (tc.score < globalYMin) globalYMin = tc.score;
-                            if (tc.score > globalYMax) globalYMax = tc.score;
-                            return { id: tc.id, score: tc.score };
-                          });
+                          const data = (sub.testCases ?? [])
+                            .filter((tc: any) => {
+                              if (typeof seedRange.min === 'number' && tc.id < seedRange.min) return false;
+                              if (typeof seedRange.max === 'number' && tc.id > seedRange.max) return false;
+                              if (showFavoritesOnly && !favorites.has(tc.id)) return false;
+                              return true;
+                            })
+                            .map((tc: any) => {
+                              if (tc.score < globalYMin) globalYMin = tc.score;
+                              if (tc.score > globalYMax) globalYMax = tc.score;
+                              return { id: tc.id, score: tc.score };
+                            });
                           return { subId: sub.id, subName: sub.name, data };
                         });
                         if (globalYMin === Infinity) { globalYMin = 0; globalYMax = 100; }
@@ -1858,6 +2094,28 @@ function App() {
                   >
                     <Folder size={18} className="text-blue-500" />
                     {isProcessing ? '展開中...' : 'ZIPファイルを参照して展開...'}
+                  </button>
+                </div>
+
+                {/* ビジュアライザキャッシュ再ダウンロード */}
+                <div className="pt-2">
+                  <label className="block text-sm font-bold text-gray-700 mb-1">ビジュアライザの再ダウンロード</label>
+                  <p className="text-xs text-gray-500 mb-3">キャッシュを削除し、次回起動時に再取得します。</p>
+                  <button
+                    onClick={async () => {
+                      if (!currentContest) return;
+                      try {
+                        await invoke('reset_visualizer_cache', { contestName: currentContest });
+                        showStatus('success', 'ビジュアライザのキャッシュを削除しました。次回ビジュアライズ時に再ダウンロードされます。');
+                      } catch (e) {
+                        showStatus('error', 'キャッシュ削除に失敗しました: ' + String(e));
+                      }
+                    }}
+                    disabled={isProcessing}
+                    className="px-4 py-2 bg-white hover:bg-gray-50 text-gray-700 rounded-lg border border-gray-300 shadow-sm transition-colors flex items-center gap-2 font-bold disabled:opacity-50"
+                  >
+                    <Eye size={18} className="text-purple-500" />
+                    キャッシュを削除して再ダウンロード
                   </button>
                 </div>
 
