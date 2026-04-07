@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import Editor from '@monaco-editor/react';
-import { Code2, Play, LayoutList, Settings, Plus, Folder, ArrowLeft, Loader2, CheckCircle2, AlertCircle, Trophy, Edit2, Clock, Trash2, FileCode2, Eye, ExternalLink, BarChart2, Copy, Check, Star } from 'lucide-react';
+import { Code2, Play, LayoutList, Settings, Plus, Folder, ArrowLeft, Loader2, CheckCircle2, AlertCircle, Trophy, Edit2, Clock, Trash2, FileCode2, Eye, ExternalLink, BarChart2, Copy, Check, Star, Sliders, Zap, StopCircle, TrendingUp, RefreshCw } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { readText } from '@tauri-apps/plugin-clipboard-manager';
@@ -21,7 +21,75 @@ type ContestConfig = {
   variables: string;
 };
 
+type TuningParam = {
+  id: string;
+  name: string;
+  currentValue: number;
+  minValue: number;
+  maxValue: number;
+  stepSize: number;
+  paramType: 'int' | 'float';
+};
+
+type TuningResult = {
+  iteration: number;
+  params: Record<string, number>;
+  score: number;
+  timestamp: number;
+};
+
 // --- ↓ ユーティリティ関数 ↓ ---
+// 定数チューニング用: コード内の定数値を置換
+const replaceConstantInCode = (code: string, name: string, value: number, paramType: 'int' | 'float'): string => {
+  const valStr = paramType === 'int' ? String(Math.round(value)) : value.toString();
+  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const patterns = [
+    new RegExp(`((?:const\\s+)?(?:long\\s+long|int|double|float|i32|i64|u32|u64|f64|f32|usize|isize)\\s+${esc}\\s*=\\s*)[\\d.e+\\-]+`, 'g'),
+    new RegExp(`(#define\\s+${esc}\\s+)[\\d.e+\\-]+`, 'g'),
+    new RegExp(`(const\\s+${esc}\\s*:\\s*[\\w]+\\s*=\\s*)[\\d.e+\\-]+`, 'g'),
+    new RegExp(`(let(?:\\s+mut)?\\s+${esc}\\s*(?::[^=\n]*)?=\\s*)[\\d.e+\\-]+`, 'g'),
+    new RegExp(`(^[ \\t]*${esc}\\s*=\\s*)[\\d.e+\\-]+`, 'gm'),
+  ];
+  for (const pat of patterns) {
+    const replaced = code.replace(pat, `$1${valStr}`);
+    if (replaced !== code) return replaced;
+  }
+  return code;
+};
+
+// コードから定数を自動検出
+const detectConstantsFromCode = (code: string): TuningParam[] => {
+  const results: TuningParam[] = [];
+  const seen = new Set<string>();
+  const addParam = (name: string, rawVal: string) => {
+    if (seen.has(name)) return;
+    const val = parseFloat(rawVal);
+    if (isNaN(val)) return;
+    seen.add(name);
+    const isFloat = rawVal.includes('.');
+    const absVal = Math.abs(val);
+    results.push({
+      id: `${name}_${Date.now()}_${Math.random()}`,
+      name,
+      currentValue: val,
+      minValue: isFloat ? Math.max(0, val * 0.2) : Math.max(1, Math.floor(val * 0.2)),
+      maxValue: isFloat ? val * 5 : Math.ceil(val * 5),
+      stepSize: isFloat ? Math.max(0.01, absVal * 0.1) : Math.max(1, Math.round(absVal * 0.1)),
+      paramType: isFloat ? 'float' : 'int',
+    });
+  };
+  const patterns: [RegExp, number, number][] = [
+    [/(?:const\s+)?(?:long\s+long|int|double|float)\s+([A-Z_][A-Z0-9_]{1,})\s*=\s*([\d.e+\-]+)/g, 1, 2],
+    [/#define\s+([A-Z_][A-Z0-9_]{1,})\s+([\d.e+\-]+)/g, 1, 2],
+    [/const\s+([A-Z_][A-Z0-9_]{1,})\s*:\s*\w+\s*=\s*([\d.e+\-]+)/g, 1, 2],
+  ];
+  for (const [pat, ni, vi] of patterns) {
+    let m: RegExpExecArray | null;
+    while ((m = pat.exec(code)) !== null) addParam(m[ni], m[vi]);
+  }
+  return results;
+};
+
 // ピアソンの相関係数を計算
 const calcCorrelation = (x: number[], y: number[]) => {
   const n = x.length;
@@ -535,6 +603,7 @@ const formatTimestamp = (timestamp: number) => {
 function App() {
   const visIframeRef = useRef<HTMLIFrameElement>(null);
   const editorRef = useRef<any>(null);
+  const clipboardCacheRef = useRef<string>(''); // Ctrl+A後のクリップボード汚染対策用キャッシュ
   const [contests, setContests] = useState<ContestItem[]>([]);
   const [sortType, setSortType] = useState<'date' | 'name'>('date');
   const [currentContest, setCurrentContest] = useState<string | null>(null);
@@ -555,9 +624,33 @@ function App() {
 
   const [confirmDialog, setConfirmDialog] = useState<{ message: string; subMessage?: string; onConfirm: () => void; confirmLabel?: string } | null>(null);
 
+  // ── 定数チューニング state ──
+  const [tuningParams, setTuningParams] = useState<TuningParam[]>([]);
+  const [tuningTestCases, setTuningTestCases] = useState(20);
+  const [tuningStatus, setTuningStatus] = useState<'idle' | 'running' | 'paused'>('idle');
+  const [tuningIterCount, setTuningIterCount] = useState(0);
+  const [tuningBest, setTuningBest] = useState<TuningResult | null>(null);
+  const [tuningHistory, setTuningHistory] = useState<TuningResult[]>([]);
+  const [tuningAvgIterSec, setTuningAvgIterSec] = useState<number | null>(null);
+  const [tuningElapsedSec, setTuningElapsedSec] = useState(0);
+  const isTuningRef = useRef(false);
+  const shouldPauseTuningRef = useRef(false);
+  const tuningPausedRef = useRef(false);
+  const tuningBestRef = useRef<TuningResult | null>(null);
+  const tuningStartTimeRef = useRef(0);
+  const tuningElapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const showConfirm = (message: string, subMessage: string | undefined, onConfirm: () => void, confirmLabel?: string) => {
     setConfirmDialog({ message, subMessage, onConfirm, confirmLabel });
   };
+
+  // ファイルダイアログの初期フォルダ（WSL環境でCドライブを開くための設定）
+  const [dialogDefaultPath, setDialogDefaultPath] = useState<string>(() => {
+    return localStorage.getItem('heu_dialog_default_path') || '/mnt/c/';
+  });
+  useEffect(() => {
+    localStorage.setItem('heu_dialog_default_path', dialogDefaultPath);
+  }, [dialogDefaultPath]);
 
   const [isProcessing, setIsProcessing] = useState(false);
   const cancelRef = useRef(false);
@@ -728,6 +821,39 @@ function App() {
   };
 
   useEffect(() => { loadContests(); }, []);
+
+  // ── コンテストごとの制限値・チューニング設定をlocalStorageから復元 ──
+  const limitsLoadedRef = useRef(false);
+  useEffect(() => {
+    if (!currentContest) { limitsLoadedRef.current = false; return; }
+    limitsLoadedRef.current = false;
+    try {
+      const saved = localStorage.getItem(`heu_limits_${currentContest}`);
+      if (saved) {
+        const { testCases: tc, timeLimit: tl, memoryLimit: ml } = JSON.parse(saved);
+        if (tc != null) setTestCases(tc);
+        if (tl != null) setTimeLimit(tl);
+        if (ml != null) setMemoryLimit(ml);
+      }
+      const savedTuning = localStorage.getItem(`heu_tuning_${currentContest}`);
+      if (savedTuning) {
+        const { params, testCases: ttc } = JSON.parse(savedTuning);
+        if (params) setTuningParams(params);
+        if (ttc != null) setTuningTestCases(ttc);
+      }
+    } catch {}
+    setTimeout(() => { limitsLoadedRef.current = true; }, 150);
+  }, [currentContest]);
+
+  useEffect(() => {
+    if (!currentContest || !limitsLoadedRef.current) return;
+    localStorage.setItem(`heu_limits_${currentContest}`, JSON.stringify({ testCases, timeLimit, memoryLimit }));
+  }, [testCases, timeLimit, memoryLimit, currentContest]);
+
+  useEffect(() => {
+    if (!currentContest || !limitsLoadedRef.current) return;
+    localStorage.setItem(`heu_tuning_${currentContest}`, JSON.stringify({ params: tuningParams, testCases: tuningTestCases }));
+  }, [tuningParams, tuningTestCases, currentContest]);
   useEffect(() => {
     if (currentContest) {
       invoke<ContestConfig>('get_contest_config', { contestName: currentContest })
@@ -798,7 +924,8 @@ function App() {
         directory: false,
         multiple: false,
         filters: [{ name: 'ZIP Files', extensions: ['zip'] }],
-        title: "toolsのZIPファイルを選択してください"
+        title: "toolsのZIPファイルを選択してください",
+        defaultPath: dialogDefaultPath || undefined,
       });
 
       if (selectedPath && typeof selectedPath === 'string') {
@@ -844,7 +971,7 @@ function App() {
   const handleCreateContest = async () => {
     if (!newContestName.trim()) { showStatus('error', 'コンテスト名を入力してください'); return; }
     try {
-      const selected = await open({ multiple: false, filters: [{ name: 'ZIP', extensions: ['zip'] }] });
+      const selected = await open({ multiple: false, filters: [{ name: 'ZIP', extensions: ['zip'] }], defaultPath: dialogDefaultPath || undefined });
       if (selected && typeof selected === 'string') {
         setIsProcessing(true);
         showStatus('info', `${newContestName} の環境を構築中...`);
@@ -923,8 +1050,135 @@ function App() {
     finally { setIsProcessing(false); }
   };
 
+  // ── 定数チューニング ──
+  const stopTuning = () => {
+    isTuningRef.current = false;
+    shouldPauseTuningRef.current = false;
+    if (tuningElapsedTimerRef.current) { clearInterval(tuningElapsedTimerRef.current); tuningElapsedTimerRef.current = null; }
+    setTuningStatus('idle');
+  };
+
+  const startTuning = async () => {
+    if (!currentContest || isTuningRef.current || tuningParams.length === 0) return;
+    const isMaximize = config?.optimize_target !== 'minimize';
+    const isBetter = (a: number, b: number) => isMaximize ? a > b : a < b;
+
+    isTuningRef.current = true;
+    shouldPauseTuningRef.current = false;
+    tuningPausedRef.current = false;
+    tuningBestRef.current = null;
+    setTuningStatus('running');
+    setTuningIterCount(0);
+    setTuningBest(null);
+    setTuningHistory([]);
+    setTuningAvgIterSec(null);
+    setTuningElapsedSec(0);
+    tuningStartTimeRef.current = Date.now();
+
+    if (tuningElapsedTimerRef.current) clearInterval(tuningElapsedTimerRef.current);
+    tuningElapsedTimerRef.current = setInterval(() => {
+      setTuningElapsedSec(Math.floor((Date.now() - tuningStartTimeRef.current) / 1000));
+    }, 1000);
+
+    let currentParams: Record<string, number> = {};
+    tuningParams.forEach(p => { currentParams[p.name] = p.currentValue; });
+
+    let iterCount = 0;
+    const iterTimes: number[] = [];
+
+    const evalParams = async (params: Record<string, number>): Promise<number> => {
+      let modifiedCode = code;
+      for (const p of tuningParams) {
+        modifiedCode = replaceConstantInCode(modifiedCode, p.name, params[p.name], p.paramType);
+      }
+      const subId = `tuning_${Date.now()}`;
+      await invoke('setup_submission', { contestName: currentContest, code: modifiedCode, language, testCases: tuningTestCases });
+
+      let totalScore = 0;
+      const queue = Array.from({ length: tuningTestCases }, (_, i) => i);
+      const concurrency = Math.max(1, (navigator.hardwareConcurrency || 4));
+      const runQ = async (q: number[]) => {
+        while (q.length > 0 && isTuningRef.current && !shouldPauseTuningRef.current) {
+          const i = q.shift();
+          if (i === undefined) break;
+          try {
+            const res = await invoke<TestCaseResult>('run_test_case', {
+              contestName: currentContest, language, caseId: i,
+              timeLimit, memoryLimit, submissionId: subId,
+            });
+            totalScore += res.score;
+          } catch {}
+        }
+      };
+      const workers = Array.from({ length: concurrency }, () => runQ(queue));
+      await Promise.all(workers);
+      return totalScore;
+    };
+
+    while (isTuningRef.current) {
+      // ポーズ待機
+      if (shouldPauseTuningRef.current) {
+        tuningPausedRef.current = true;
+        setTuningStatus('paused');
+        while (shouldPauseTuningRef.current && isTuningRef.current) {
+          await new Promise(r => setTimeout(r, 150));
+        }
+        tuningPausedRef.current = false;
+        if (!isTuningRef.current) break;
+        setTuningStatus('running');
+      }
+
+      const iterStart = Date.now();
+
+      // 近傍生成
+      const newParams = { ...currentParams };
+      const p = tuningParams[Math.floor(Math.random() * tuningParams.length)];
+      const sign = Math.random() < 0.5 ? 1 : -1;
+      let newVal = newParams[p.name] + sign * p.stepSize * (0.5 + Math.random() * 1.5);
+      newVal = Math.max(p.minValue, Math.min(p.maxValue, newVal));
+      if (p.paramType === 'int') newVal = Math.round(newVal);
+      newParams[p.name] = newVal;
+
+      let score = 0;
+      try { score = await evalParams(newParams); } catch { continue; }
+      if (!isTuningRef.current) break;
+
+      iterCount++;
+      iterTimes.push((Date.now() - iterStart) / 1000);
+      const avgTime = iterTimes.slice(-10).reduce((a, b) => a + b, 0) / Math.min(iterTimes.length, 10);
+
+      const prevBest = tuningBestRef.current;
+      const improved = prevBest === null || isBetter(score, prevBest.score);
+      if (improved) {
+        currentParams = { ...newParams };
+        const best: TuningResult = { iteration: iterCount, params: { ...newParams }, score, timestamp: Date.now() };
+        tuningBestRef.current = best;
+        setTuningBest(best);
+      }
+
+      const iter: TuningResult = { iteration: iterCount, params: { ...newParams }, score, timestamp: Date.now() };
+      setTuningHistory(prev => [iter, ...prev].slice(0, 100));
+      setTuningIterCount(iterCount);
+      setTuningAvgIterSec(avgTime);
+    }
+
+    if (tuningElapsedTimerRef.current) { clearInterval(tuningElapsedTimerRef.current); tuningElapsedTimerRef.current = null; }
+    setTuningStatus('idle');
+    isTuningRef.current = false;
+  };
+
   const handleSubmit = async () => {
     if (!currentContest) return;
+
+    // チューニング中なら一時停止して待機
+    if (isTuningRef.current) {
+      shouldPauseTuningRef.current = true;
+      const waitStart = Date.now();
+      while (!tuningPausedRef.current && isTuningRef.current && Date.now() - waitStart < 8000) {
+        await new Promise(r => setTimeout(r, 100));
+      }
+    }
+
     setIsProcessing(true);
     cancelRef.current = false;
     setSubmitError(null);
@@ -1017,7 +1271,13 @@ function App() {
       setActiveTab('submit');
       showStatus('error', 'コンパイルエラーが発生しました');
     }
-    finally { setIsProcessing(false); cancelRef.current = false; runningSubIdRef.current = null; }
+    finally {
+      setIsProcessing(false);
+      cancelRef.current = false;
+      runningSubIdRef.current = null;
+      // チューニングを再開
+      shouldPauseTuningRef.current = false;
+    }
   };
 
   const updateSubName = (id: string, newName: string) => {
@@ -1240,6 +1500,11 @@ function App() {
         <button onClick={() => { setActiveTab('submit'); setVisDataSynced(null); }} className={`px-4 py-2 rounded-t-lg font-bold border-t border-l border-r ${activeTab === 'submit' ? 'bg-white text-blue-600 border-gray-200 -mb-px' : 'bg-gray-100 text-gray-500 border-transparent hover:bg-gray-200'}`}>コード提出</button>
         <button onClick={() => { setActiveTab('submissions'); setSelectedSubId(null); setDetailTab('results'); }} className={`px-4 py-2 rounded-t-lg font-bold border-t border-l border-r flex items-center gap-1 ${activeTab === 'submissions' ? 'bg-white text-blue-600 border-gray-200 -mb-px' : 'bg-gray-100 text-gray-500 border-transparent hover:bg-gray-200'}`}><LayoutList size={18} /> 実行結果</button>
         <button onClick={() => setActiveTab('stats')} className={`px-4 py-2 rounded-t-lg font-bold border-t border-l border-r flex items-center gap-1 ${activeTab === 'stats' ? 'bg-white text-blue-600 border-gray-200 -mb-px' : 'bg-gray-100 text-gray-500 border-transparent hover:bg-gray-200'}`}><BarChart2 size={18} /> 統計 {selectedForStats.size > 0 && <span className="ml-auto bg-blue-100 text-blue-700 py-0.5 px-2 rounded-full text-xs">{selectedForStats.size}</span>}</button>
+        <button onClick={() => setActiveTab('tuning')} className={`px-4 py-2 rounded-t-lg font-bold border-t border-l border-r flex items-center gap-1 ${activeTab === 'tuning' ? 'bg-white text-purple-600 border-gray-200 -mb-px' : 'bg-gray-100 text-gray-500 border-transparent hover:bg-gray-200'}`}>
+          <Sliders size={18} /> 定数チューニング
+          {tuningStatus === 'running' && <span className="ml-1 w-2 h-2 bg-green-500 rounded-full animate-pulse inline-block" />}
+          {tuningStatus === 'paused' && <span className="ml-1 w-2 h-2 bg-yellow-500 rounded-full inline-block" />}
+        </button>
       </div>
 
       {/* 画面を左右に分割するメインエリア */}
@@ -1279,11 +1544,11 @@ function App() {
                   <button
                     onClick={async () => {
                       try {
-                        const text = await readText();
+                        let text = '';
+                        try { text = await readText() || ''; } catch {}
+                        if (!text) text = clipboardCacheRef.current;
                         if (text && editorRef.current) {
-                          const selections = editorRef.current.getSelections() ?? [];
-                          const edits = selections.map((sel: any) => ({ range: sel, text, forceMoveMarkers: true }));
-                          editorRef.current.executeEdits('clipboard-paste', edits);
+                          editorRef.current.setValue(text);
                           editorRef.current.focus();
                         }
                       } catch (err) { console.error('貼り付け失敗:', err); }
@@ -1308,17 +1573,34 @@ function App() {
                 <Editor height="100%" language={language === 'python' ? 'python' : language === 'rust' ? 'rust' : 'cpp'} theme="vs-light" value={code} onChange={(v) => setCode(v || '')}
                   onMount={(editor, monaco) => {
                     editorRef.current = editor;
+                    // フォーカス時にクリップボードをキャッシュ（Ctrl+Aによる汚染対策）
+                    editor.onDidFocusEditorWidget(async () => {
+                      try {
+                        const t = await readText();
+                        if (t) clipboardCacheRef.current = t;
+                      } catch {}
+                    });
+                    // Ctrl+A をオーバーライド: WebKit にクリップボードを触らせない
+                    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyA, () => {
+                      const model = editor.getModel();
+                      if (model) editor.setSelection(model.getFullModelRange());
+                    });
                     // Ctrl+V / Cmd+V を Tauri ネイティブクリップボード経由に上書き
                     editor.onKeyDown(async (e: any) => {
                       if ((e.ctrlKey || e.metaKey) && e.keyCode === monaco.KeyCode.KeyV && !e.shiftKey) {
                         e.preventDefault();
                         e.stopPropagation();
                         try {
-                          const text = await readText();
+                          let text = '';
+                          try { text = await readText() || ''; } catch {}
+                          if (!text) text = clipboardCacheRef.current; // Ctrl+A後の汚染フォールバック
                           if (text) {
                             const selections = editor.getSelections() ?? [];
-                            const edits = selections.map((sel: any) => ({ range: sel, text, forceMoveMarkers: true }));
-                            editor.executeEdits('clipboard-paste', edits);
+                            const model = editor.getModel();
+                            const edits = selections.length > 0
+                              ? selections.map((sel: any) => ({ range: sel, text, forceMoveMarkers: true }))
+                              : model ? [{ range: model.getFullModelRange(), text, forceMoveMarkers: true }] : [];
+                            if (edits.length > 0) editor.executeEdits('clipboard-paste', edits);
                           }
                         } catch (err) { console.error('Ctrl+V 貼り付け失敗:', err); }
                       }
@@ -2030,6 +2312,273 @@ function App() {
             </div>
           )}
           {/* ★ ここまで追加 */}
+
+          {/* ── 定数チューニングタブ ── */}
+          {activeTab === 'tuning' && (
+            <div className="flex-1 overflow-auto p-6 bg-gray-50">
+              <h2 className="text-2xl font-bold flex items-center gap-2 text-gray-800 mb-6">
+                <Sliders size={28} className="text-purple-600" /> 定数チューニング
+                {tuningStatus === 'running' && <span className="text-sm font-normal text-green-600 flex items-center gap-1"><span className="w-2 h-2 bg-green-500 rounded-full animate-pulse inline-block" /> バックグラウンド実行中</span>}
+                {tuningStatus === 'paused' && <span className="text-sm font-normal text-yellow-600 flex items-center gap-1"><span className="w-2 h-2 bg-yellow-500 rounded-full inline-block" /> 提出処理のため一時停止中...</span>}
+              </h2>
+
+              <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+
+                {/* ── 左: 設定パネル ── */}
+                <div className="xl:col-span-1 flex flex-col gap-4">
+
+                  {/* 自動検出 */}
+                  <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
+                    <div className="flex items-center justify-between mb-3 border-b pb-2">
+                      <h3 className="font-bold text-gray-700 flex items-center gap-2"><Zap size={16} className="text-yellow-500" /> 定数を検出</h3>
+                      <button
+                        onClick={() => {
+                          const detected = detectConstantsFromCode(code);
+                          if (detected.length === 0) { showStatus('error', '大文字の定数が見つかりませんでした。手動で追加してください。'); return; }
+                          setTuningParams(prev => {
+                            const existNames = new Set(prev.map(p => p.name));
+                            const newOnes = detected.filter(d => !existNames.has(d.name));
+                            showStatus('success', `${newOnes.length} 個の定数を追加しました`);
+                            return [...prev, ...newOnes];
+                          });
+                        }}
+                        className="px-3 py-1.5 bg-yellow-50 hover:bg-yellow-100 text-yellow-700 border border-yellow-200 rounded-lg text-xs font-bold transition-colors flex items-center gap-1"
+                      >
+                        <RefreshCw size={12} /> コードから検出
+                      </button>
+                    </div>
+                    <p className="text-xs text-gray-400">コードの「コード提出」タブの現在のコードから大文字定数 (<code>CONST_NAME = 値</code>) を自動検出します。</p>
+                  </div>
+
+                  {/* 手動追加 */}
+                  <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
+                    <div className="flex items-center justify-between mb-3 border-b pb-2">
+                      <h3 className="font-bold text-gray-700">チューニング対象</h3>
+                      <button
+                        onClick={() => setTuningParams(prev => [...prev, {
+                          id: `param_${Date.now()}`, name: '', currentValue: 100, minValue: 10, maxValue: 1000, stepSize: 10, paramType: 'int'
+                        }])}
+                        className="px-3 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 rounded-lg text-xs font-bold transition-colors flex items-center gap-1"
+                      >
+                        <Plus size={12} /> 追加
+                      </button>
+                    </div>
+                    {tuningParams.length === 0 ? (
+                      <p className="text-sm text-gray-400 text-center py-4">パラメータがありません</p>
+                    ) : (
+                      <div className="space-y-3 max-h-80 overflow-y-auto pr-1">
+                        {tuningParams.map((p, i) => (
+                          <div key={p.id} className="bg-gray-50 rounded-lg p-3 border border-gray-200 text-xs">
+                            <div className="flex items-center gap-2 mb-2">
+                              <input
+                                type="text"
+                                placeholder="定数名 (例: BEAM_WIDTH)"
+                                value={p.name}
+                                onChange={e => setTuningParams(prev => prev.map((x, j) => j === i ? { ...x, name: e.target.value } : x))}
+                                className="flex-1 border border-gray-300 rounded px-2 py-1 text-xs font-mono font-bold focus:ring-1 focus:ring-blue-400 outline-none"
+                              />
+                              <select value={p.paramType} onChange={e => setTuningParams(prev => prev.map((x, j) => j === i ? { ...x, paramType: e.target.value as 'int' | 'float' } : x))}
+                                className="border border-gray-300 rounded px-1 py-1 text-xs bg-white">
+                                <option value="int">int</option>
+                                <option value="float">float</option>
+                              </select>
+                              <button onClick={() => setTuningParams(prev => prev.filter((_, j) => j !== i))} className="text-red-400 hover:text-red-600 p-1 rounded hover:bg-red-50 transition-colors"><Trash2 size={13} /></button>
+                            </div>
+                            <div className="grid grid-cols-4 gap-1.5">
+                              {[
+                                ['現在値', 'currentValue'],
+                                ['最小', 'minValue'],
+                                ['最大', 'maxValue'],
+                                ['ステップ', 'stepSize'],
+                              ].map(([label, key]) => (
+                                <div key={key}>
+                                  <p className="text-gray-400 mb-0.5">{label}</p>
+                                  <input
+                                    type="number"
+                                    step={p.paramType === 'float' ? '0.01' : '1'}
+                                    value={(p as any)[key]}
+                                    onChange={e => setTuningParams(prev => prev.map((x, j) => j === i ? { ...x, [key]: p.paramType === 'float' ? parseFloat(e.target.value) || 0 : parseInt(e.target.value) || 0 } : x))}
+                                    className="w-full border border-gray-300 rounded px-1.5 py-1 text-xs bg-white font-mono focus:ring-1 focus:ring-blue-400 outline-none"
+                                  />
+                                </div>
+              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* 実行設定 */}
+                  <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
+                    <h3 className="font-bold text-gray-700 border-b pb-2 mb-3">実行設定</h3>
+                    <div className="space-y-3">
+                      <div>
+                        <label className="text-xs font-bold text-gray-500 block mb-1">1反復あたりのテストケース数</label>
+                        <input type="number" min={1} max={testCases} value={tuningTestCases}
+                          onChange={e => setTuningTestCases(Math.max(1, Math.min(testCases, Number(e.target.value))))}
+                          className="border rounded p-1.5 w-full text-sm bg-white font-mono"
+                        />
+                        <p className="text-xs text-gray-400 mt-1">現在の提出設定: {testCases} ケース</p>
+                      </div>
+                    </div>
+
+                    <div className="mt-4 flex gap-2">
+                      {tuningStatus === 'idle' ? (
+                        <button
+                          onClick={startTuning}
+                          disabled={tuningParams.length === 0 || tuningParams.some(p => !p.name.trim())}
+                          className="flex-1 px-4 py-2.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-40 text-white font-bold rounded-lg flex items-center justify-center gap-2 transition-colors shadow-sm"
+                        >
+                          <Zap size={16} /> チューニング開始
+                        </button>
+                      ) : (
+                        <button
+                          onClick={stopTuning}
+                          className="flex-1 px-4 py-2.5 bg-red-500 hover:bg-red-600 text-white font-bold rounded-lg flex items-center justify-center gap-2 transition-colors shadow-sm"
+                        >
+                          <StopCircle size={16} /> 停止
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-xs text-gray-400 mt-2 text-center">別タブに移動しても実行継続。提出時は自動で一時停止→再開します。</p>
+                  </div>
+                </div>
+
+                {/* ── 右: 進捗・結果パネル ── */}
+                <div className="xl:col-span-2 flex flex-col gap-4">
+
+                  {/* 進捗カード */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    {[
+                      { label: '反復数', value: tuningIterCount.toString(), sub: null, color: 'text-gray-800' },
+                      { label: '経過時間', value: `${Math.floor(tuningElapsedSec / 60)}:${String(tuningElapsedSec % 60).padStart(2, '0')}`, sub: null, color: 'text-gray-800' },
+                      { label: '1反復の平均時間', value: tuningAvgIterSec != null ? `${tuningAvgIterSec.toFixed(1)}s` : '--', sub: null, color: 'text-blue-700' },
+                      { label: 'ベストスコア', value: tuningBest ? tuningBest.score.toLocaleString() : '--', sub: tuningBest ? `iter ${tuningBest.iteration}` : null, color: 'text-purple-700' },
+                    ].map(card => (
+                      <div key={card.label} className="bg-white rounded-xl border border-gray-200 shadow-sm p-4 flex flex-col gap-1">
+                        <p className="text-xs text-gray-500 font-bold">{card.label}</p>
+                        <p className={`text-2xl font-mono font-bold ${card.color}`}>{card.value}</p>
+                        {card.sub && <p className="text-xs text-gray-400">{card.sub}</p>}
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* ベストパラメータ */}
+                  {tuningBest && (
+                    <div className="bg-white rounded-xl shadow-sm border border-purple-200 p-4">
+                      <div className="flex items-center justify-between mb-3 border-b border-purple-100 pb-2">
+                        <h3 className="font-bold text-purple-700 flex items-center gap-2"><TrendingUp size={16} /> ベスト構成 (iter {tuningBest.iteration})</h3>
+                        <button
+                          onClick={() => {
+                            let newCode = code;
+                            tuningParams.forEach(p => {
+                              const val = tuningBest!.params[p.name];
+                              if (val !== undefined) newCode = replaceConstantInCode(newCode, p.name, val, p.paramType);
+                            });
+                            setCode(newCode);
+                            setActiveTab('submit');
+                            showStatus('success', 'ベスト値をコードに反映しました');
+                          }}
+                          className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold rounded-lg transition-colors flex items-center gap-1"
+                        >
+                          <Check size={12} /> コードに反映
+                        </button>
+                      </div>
+                      <div className="flex flex-wrap gap-3">
+                        {tuningParams.map(p => (
+                          <div key={p.id} className="bg-purple-50 border border-purple-200 rounded-lg px-3 py-2 min-w-[120px]">
+                            <p className="text-xs text-purple-500 font-bold font-mono">{p.name}</p>
+                            <p className="text-lg font-mono font-bold text-purple-800">
+                              {p.paramType === 'float'
+                                ? (tuningBest.params[p.name] ?? p.currentValue).toFixed(4)
+                                : (tuningBest.params[p.name] ?? p.currentValue).toLocaleString()
+                              }
+                            </p>
+                            <p className="text-xs text-purple-400">初期: {p.currentValue}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 履歴グラフ + テーブル */}
+                  <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
+                    <h3 className="font-bold text-gray-700 border-b pb-2 mb-3 flex items-center gap-2"><BarChart2 size={16} /> 反復履歴 (最新100件)</h3>
+                    {tuningHistory.length === 0 ? (
+                      <p className="text-sm text-gray-400 text-center py-8">{tuningStatus === 'idle' ? 'チューニングを開始してください' : '実行中...'}</p>
+                    ) : (
+                      <>
+                        {/* ミニチャート */}
+                        {(() => {
+                          const data = [...tuningHistory].reverse();
+                          const scores = data.map(d => d.score);
+                          const minS = Math.min(...scores), maxS = Math.max(...scores);
+                          const range = maxS === minS ? 1 : maxS - minS;
+                          const W = 560, H = 120, ML = 50, MB = 20, MT = 8, MR = 8;
+                          const iW = W - ML - MR, iH = H - MB - MT;
+                          const toX = (i: number) => ML + (i / Math.max(1, data.length - 1)) * iW;
+                          const toY = (s: number) => MT + (1 - (s - minS) / range) * iH;
+                          const pts = data.map((d, i) => `${toX(i)},${toY(d.score)}`).join(' ');
+                          const bestScoreInHistory = config?.optimize_target === 'minimize' ? Math.min(...scores) : Math.max(...scores);
+                          return (
+                            <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: H, display: 'block' }} className="mb-3">
+                              <line x1={ML} y1={MT} x2={ML} y2={H - MB} stroke="#d1d5db" strokeWidth={1} />
+                              <line x1={ML} y1={H - MB} x2={W - MR} y2={H - MB} stroke="#d1d5db" strokeWidth={1} />
+                              {[0, 0.5, 1].map((t, i) => {
+                                const y = MT + (1 - t) * iH;
+                                const val = minS + t * range;
+                                return <g key={i}><line x1={ML} y1={y} x2={W - MR} y2={y} stroke="#f3f4f6" strokeWidth={1} /><text x={ML - 4} y={y + 4} textAnchor="end" fontSize={9} fill="#9ca3af">{Math.round(val).toLocaleString()}</text></g>;
+                              })}
+                              <polyline points={pts} fill="none" stroke="#8b5cf6" strokeWidth={1.5} strokeOpacity={0.7} />
+                              {data.map((d, i) => d.score === bestScoreInHistory ? <circle key={i} cx={toX(i)} cy={toY(d.score)} r={4} fill="#7c3aed" /> : null)}
+                              {tuningBest && (() => {
+                                const bestIdx = data.findIndex(d => d.iteration === tuningBest!.iteration);
+                                if (bestIdx < 0) return null;
+                                return <circle cx={toX(bestIdx)} cy={toY(tuningBest.score)} r={5} fill="#7c3aed" stroke="white" strokeWidth={2} />;
+                              })()}
+                            </svg>
+                          );
+                        })()}
+
+                        {/* 履歴テーブル */}
+                        <div className="max-h-64 overflow-y-auto">
+                          <table className="w-full text-xs text-right">
+                            <thead className="sticky top-0 bg-white">
+                              <tr className="text-gray-400 border-b">
+                                <th className="py-1.5 px-2 text-left font-normal">iter</th>
+                                <th className="py-1.5 px-2 font-normal">スコア</th>
+                                {tuningParams.map(p => <th key={p.id} className="py-1.5 px-2 font-mono font-normal">{p.name}</th>)}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {tuningHistory.map((h, i) => {
+                                const isBestRow = tuningBest && h.iteration === tuningBest.iteration;
+                                return (
+                                  <tr key={i} className={`border-b last:border-0 ${isBestRow ? 'bg-purple-50' : 'hover:bg-gray-50'}`}>
+                                    <td className="py-1.5 px-2 text-left text-gray-500 font-mono">#{h.iteration}</td>
+                                    <td className={`py-1.5 px-2 font-mono font-bold ${isBestRow ? 'text-purple-700' : 'text-gray-700'}`}>
+                                      {h.score.toLocaleString()} {isBestRow && '★'}
+                                    </td>
+                                    {tuningParams.map(p => (
+                                      <td key={p.id} className="py-1.5 px-2 font-mono text-gray-600">
+                                        {p.paramType === 'float' ? (h.params[p.name] ?? '?').toString().slice(0, 8) : h.params[p.name] ?? '?'}
+                                      </td>
+                                    ))}
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
         </div>
 
         {/* ★ ここから追加：設定＆ケース生成モーダル */}
@@ -2117,6 +2666,41 @@ function App() {
                     <Eye size={18} className="text-purple-500" />
                     キャッシュを削除して再ダウンロード
                   </button>
+                </div>
+
+                {/* ファイルダイアログ初期フォルダ */}
+                <div className="pt-4 border-t">
+                  <label className="block text-sm font-bold text-gray-700 mb-1">
+                    ファイルダイアログの初期フォルダ
+                  </label>
+                  <p className="text-xs text-gray-500 mb-2">
+                    ZIPを選択するダイアログが開く場所です。WSL環境でWindowsのCドライブを参照する場合は{' '}
+                    <code className="bg-gray-100 px-1 rounded font-mono">/mnt/c/</code> などを指定してください。
+                  </p>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={dialogDefaultPath}
+                      onChange={e => setDialogDefaultPath(e.target.value)}
+                      placeholder="/mnt/c/"
+                      className="flex-1 border border-gray-300 rounded-lg p-2 text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                    />
+                    <button
+                      onClick={() => setDialogDefaultPath('/mnt/c/')}
+                      className="px-3 py-2 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-lg text-xs font-bold border border-gray-300 transition-colors whitespace-nowrap"
+                    >
+                      C: ドライブ
+                    </button>
+                    <button
+                      onClick={() => setDialogDefaultPath('/mnt/d/')}
+                      className="px-3 py-2 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-lg text-xs font-bold border border-gray-300 transition-colors whitespace-nowrap"
+                    >
+                      D: ドライブ
+                    </button>
+                  </div>
+                  <p className="text-xs text-gray-400 mt-1.5">
+                    ※ この設定はすべてのコンテストで共通です（再起動後も保持）
+                  </p>
                 </div>
 
                 {/* ケース生成機能 */}
