@@ -160,6 +160,10 @@ fn escape_html_for_srcdoc(html: &str) -> String {
         .replace("'", "&#39;")
 }
 
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\"'\"'"))
+}
+
 #[tauri::command]
 fn get_contests() -> Result<Vec<ContestItem>, String> {
     let mut contests = Vec::new();
@@ -734,6 +738,7 @@ async fn run_test_case(
     time_limit: f64,
     memory_limit: usize,
     submission_id: String,
+    exec_args: Option<Vec<String>>,
 ) -> Result<TestCaseResult, String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
@@ -784,6 +789,7 @@ async fn run_test_case(
         .join("release")
         .join(format!("tester{}", exe_suffix));
     let use_tester = tester_bin.exists();
+    let exec_args = exec_args.unwrap_or_default();
 
     let mut last_result = TestCaseResult {
         id: case_id,
@@ -797,14 +803,32 @@ async fn run_test_case(
         #[cfg(unix)]
         let mut cmd = {
             let kb = memory_limit * 1024;
+            let joined_args = if exec_args.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " {}",
+                    exec_args
+                        .iter()
+                        .map(|arg| shell_quote(arg))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            };
             let user_cmd = if language == "python" {
                 format!(
-                    "ulimit -v {}; exec python3 \"{}\"",
+                    "ulimit -v {}; exec python3 \"{}\"{}",
                     kb,
-                    src_path.to_str().unwrap()
+                    src_path.to_str().unwrap(),
+                    joined_args
                 )
             } else {
-                format!("ulimit -v {}; exec \"{}\"", kb, exe_path.to_str().unwrap())
+                format!(
+                    "ulimit -v {}; exec \"{}\"{}",
+                    kb,
+                    exe_path.to_str().unwrap(),
+                    joined_args
+                )
             };
             if use_tester {
                 let mut c = Command::new(&tester_bin);
@@ -823,19 +847,24 @@ async fn run_test_case(
                 if use_tester {
                     let mut c = Command::new(&tester_bin);
                     c.arg("python3").arg(&src_path);
+                    c.args(&exec_args);
                     c
                 } else {
                     let mut c = Command::new("python3");
                     c.arg(&src_path);
+                    c.args(&exec_args);
                     c
                 }
             } else {
                 if use_tester {
                     let mut c = Command::new(&tester_bin);
                     c.arg(&exe_path);
+                    c.args(&exec_args);
                     c
                 } else {
-                    Command::new(&exe_path)
+                    let mut c = Command::new(&exe_path);
+                    c.args(&exec_args);
+                    c
                 }
             }
         };
@@ -1133,6 +1162,13 @@ async fn save_contest_config(contest_name: String, config: ContestConfig) -> Res
 }
 
 #[tauri::command]
+fn get_available_parallelism() -> Result<usize, String> {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .map_err(|e| format!("並列数取得失敗: {}", e))
+}
+
+#[tauri::command]
 async fn get_testcase_variables(
     contest_name: String,
 ) -> Result<HashMap<usize, HashMap<String, f64>>, String> {
@@ -1413,6 +1449,7 @@ fn main() {
             save_testcase_favorites,
             get_contest_config,
             save_contest_config,
+            get_available_parallelism,
             get_testcase_variables,
             update_tools_from_zip,
             rename_contest

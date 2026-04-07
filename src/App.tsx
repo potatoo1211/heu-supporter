@@ -27,7 +27,7 @@ type TuningParam = {
   currentValue: number;
   minValue: number;
   maxValue: number;
-  stepSize: number;
+  divisions: number;
   paramType: 'int' | 'float';
 };
 
@@ -38,8 +38,28 @@ type TuningResult = {
   timestamp: number;
 };
 
-// --- ↓ ユーティリティ関数 ↓ ---
-// 定数チューニング用: コード内の定数値を置換
+type TuningSession = {
+  id: string;
+  name: string;
+  savedAt: number;
+  code: string;
+  params: TuningParam[];
+  testCases: number;
+  history: TuningResult[];
+  best: TuningResult | null;
+};
+
+const normalizeTuningParamsForCompare = (params: TuningParam[]) => params.map(p => ({
+  name: p.name.trim(),
+  currentValue: p.currentValue,
+  minValue: p.minValue,
+  maxValue: p.maxValue,
+  divisions: p.divisions,
+  paramType: p.paramType,
+}));
+
+const SCORE_FILTER_KEY = '__absolute_score__';
+
 const replaceConstantInCode = (code: string, name: string, value: number, paramType: 'int' | 'float'): string => {
   const valStr = paramType === 'int' ? String(Math.round(value)) : value.toString();
   const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -57,6 +77,36 @@ const replaceConstantInCode = (code: string, name: string, value: number, paramT
   return code;
 };
 
+const buildCodeWithTuningParams = (baseCode: string, params: TuningParam[], values: Record<string, number>) => {
+  let nextCode = baseCode;
+  params.forEach(param => {
+    const value = values[param.name];
+    if (value !== undefined) nextCode = replaceConstantInCode(nextCode, param.name, value, param.paramType);
+  });
+  return nextCode;
+};
+
+const getTuningStepSize = (param: TuningParam) => {
+  const span = Math.max(param.maxValue - param.minValue, 0);
+  const divisions = Math.max(1, Math.floor(param.divisions || 1));
+  const raw = span / divisions;
+  if (param.paramType === 'float') return Math.max(0.0001, raw || 0.0001);
+  return Math.max(1, Math.round(raw || 1));
+};
+
+const buildTuningDiscreteValues = (param: TuningParam) => {
+  const divisions = Math.max(1, Math.floor(param.divisions || 1));
+  const normalize = (value: number) => param.paramType === 'float'
+    ? Number(value.toFixed(6))
+    : Math.round(value);
+  if (param.maxValue === param.minValue) return [normalize(param.minValue)];
+  const values = Array.from({ length: divisions + 1 }, (_, i) => {
+    const t = i / divisions;
+    return normalize(param.minValue + (param.maxValue - param.minValue) * t);
+  });
+  return Array.from(new Set(values)).sort((a, b) => a - b);
+};
+
 // コードから定数を自動検出
 const detectConstantsFromCode = (code: string): TuningParam[] => {
   const results: TuningParam[] = [];
@@ -67,14 +117,13 @@ const detectConstantsFromCode = (code: string): TuningParam[] => {
     if (isNaN(val)) return;
     seen.add(name);
     const isFloat = rawVal.includes('.');
-    const absVal = Math.abs(val);
     results.push({
       id: `${name}_${Date.now()}_${Math.random()}`,
       name,
       currentValue: val,
       minValue: isFloat ? Math.max(0, val * 0.2) : Math.max(1, Math.floor(val * 0.2)),
       maxValue: isFloat ? val * 5 : Math.ceil(val * 5),
-      stepSize: isFloat ? Math.max(0.01, absVal * 0.1) : Math.max(1, Math.round(absVal * 0.1)),
+      divisions: 5,
       paramType: isFloat ? 'float' : 'int',
     });
   };
@@ -179,6 +228,14 @@ interface HoverInfo { score: number; id: number; label: string; px: number; py: 
 interface ScatterPoint { x: number; y: number; id: number }
 interface ScatterSeries { subId: string; subName: string; data: ScatterPoint[] }
 
+type RelScoreTooltip = {
+  caseId: number;
+  x: number;
+  y: number;
+  bestScore: number;
+  winners: { id: string; name: string; score: number }[];
+};
+
 // ページネーションコンポーネント
 const Pagination = ({ page, total, pageSize, onPage, onPageSize }: {
   page: number; total: number; pageSize: number;
@@ -205,6 +262,123 @@ const Pagination = ({ page, total, pageSize, onPage, onPageSize }: {
           className="px-2 py-1 rounded disabled:opacity-30 hover:bg-gray-100 transition-colors font-bold">›</button>
         <button onClick={() => onPage(totalPages)} disabled={page === totalPages}
           className="px-1.5 py-1 rounded disabled:opacity-30 hover:bg-gray-100 transition-colors font-bold">»</button>
+      </div>
+    </div>
+  );
+};
+
+const TuningRangeSlider = ({ param, onChange }: {
+  param: TuningParam;
+  onChange: (next: Partial<TuningParam>) => void;
+}) => {
+  const coreMin = Math.min(param.minValue, param.maxValue, param.currentValue);
+  const coreMax = Math.max(param.minValue, param.maxValue, param.currentValue);
+  const coreRange = Math.max(coreMax - coreMin, 1);
+  const padding = Math.max(coreRange * 0.75, Math.abs(coreMin) * 0.25, Math.abs(coreMax) * 0.25, 1);
+  const sliderMin = coreMin - padding;
+  const sliderMax = coreMax + padding;
+  const range = sliderMax - sliderMin || 1;
+  const left = ((param.minValue - sliderMin) / range) * 100;
+  const right = ((param.maxValue - sliderMin) / range) * 100;
+  const current = ((param.currentValue - sliderMin) / range) * 100;
+  const divisionCount = Math.max(1, Math.floor(param.divisions || 1));
+  const handleOffsetPx = 8;
+  const display = (value: number) => param.paramType === 'float'
+    ? value.toFixed(3).replace(/\.?0+$/, '')
+    : Math.round(value).toLocaleString();
+  const sliderRef = React.useRef<HTMLDivElement | null>(null);
+  const dragRef = React.useRef<{ side: 'min' | 'max'; startValue: number } | null>(null);
+
+  const normalizeValue = (value: number) => {
+    if (param.paramType === 'float') return Number(value.toFixed(3));
+    return Math.round(value);
+  };
+
+  const dragLimit = (startValue: number) => Math.max(Math.abs(startValue), 1);
+
+  const startDrag = (side: 'min' | 'max') => (e: React.MouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragRef.current = {
+      side,
+      startValue: side === 'min' ? param.minValue : param.maxValue,
+    };
+
+    const handleMove = (ev: MouseEvent) => {
+      const drag = dragRef.current;
+      const slider = sliderRef.current;
+      if (!drag || !slider) return;
+      const rect = slider.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (ev.clientX - rect.left) / Math.max(rect.width, 1)));
+      const rawValue = sliderMin + ratio * range;
+      const limited = Math.max(
+        drag.startValue - dragLimit(drag.startValue),
+        Math.min(drag.startValue + dragLimit(drag.startValue), rawValue),
+      );
+      const value = normalizeValue(limited);
+
+      if (drag.side === 'min') {
+        const capped = Math.min(value, param.currentValue);
+        onChange({
+          minValue: Math.min(capped, param.maxValue),
+        });
+      } else {
+        const capped = Math.max(value, param.currentValue);
+        onChange({
+          maxValue: Math.max(capped, param.minValue),
+        });
+      }
+    };
+
+    const handleUp = () => {
+      dragRef.current = null;
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup', handleUp);
+    };
+
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleUp);
+  };
+
+  return (
+    <div className="space-y-2">
+      <div ref={sliderRef} className="relative pt-6 pb-5">
+        <div className="absolute left-0 right-0 top-[26px] h-2 rounded-full bg-gray-200" />
+        <div
+          className="absolute top-[26px] h-2 rounded-full bg-purple-400"
+          style={{ left: `${left}%`, width: `${Math.max(0, right - left)}%` }}
+        />
+        {Array.from({ length: divisionCount + 1 }, (_, i) => {
+          const pos = left + ((right - left) * i) / divisionCount;
+          return (
+            <div key={i} className="absolute top-[20px] -translate-x-1/2" style={{ left: `${pos}%` }}>
+              <div className="w-1 h-1 rounded-full bg-purple-700/70" />
+            </div>
+          );
+        })}
+        <div className="absolute top-[18px] -translate-x-1/2" style={{ left: `${current}%` }}>
+          <div className="w-3 h-3 rounded-full bg-emerald-500 border-2 border-white shadow" />
+        </div>
+        <div
+          className="absolute top-[19px] -translate-x-1/2 cursor-ew-resize"
+          style={{ left: `calc(${left}% - ${handleOffsetPx}px)` }}
+          onMouseDown={startDrag('min')}
+        >
+          <div className="w-4 h-4 rounded-full bg-purple-600 border-2 border-white shadow-md" />
+        </div>
+        <div
+          className="absolute top-[19px] -translate-x-1/2 cursor-ew-resize"
+          style={{ left: `calc(${right}% + ${handleOffsetPx}px)` }}
+          onMouseDown={startDrag('max')}
+        >
+          <div className="w-4 h-4 rounded-full bg-purple-600 border-2 border-white shadow-md" />
+        </div>
+      </div>
+      <div className="flex items-center justify-between text-[11px] text-gray-500 font-mono">
+        <span>min {display(param.minValue)}</span>
+        <span className="text-emerald-600 font-bold">current {display(param.currentValue)}</span>
+        <span>{divisionCount} 分割</span>
+        <span>max {display(param.maxValue)}</span>
       </div>
     </div>
   );
@@ -604,6 +778,7 @@ function App() {
   const visIframeRef = useRef<HTMLIFrameElement>(null);
   const editorRef = useRef<any>(null);
   const clipboardCacheRef = useRef<string>(''); // Ctrl+A後のクリップボード汚染対策用キャッシュ
+  const [logicalProcessorCount, setLogicalProcessorCount] = useState(4);
   const [contests, setContests] = useState<ContestItem[]>([]);
   const [sortType, setSortType] = useState<'date' | 'name'>('date');
   const [currentContest, setCurrentContest] = useState<string | null>(null);
@@ -626,19 +801,24 @@ function App() {
 
   // ── 定数チューニング state ──
   const [tuningParams, setTuningParams] = useState<TuningParam[]>([]);
+  const [tuningCode, setTuningCode] = useState('');
   const [tuningTestCases, setTuningTestCases] = useState(20);
   const [tuningStatus, setTuningStatus] = useState<'idle' | 'running' | 'paused'>('idle');
   const [tuningIterCount, setTuningIterCount] = useState(0);
   const [tuningBest, setTuningBest] = useState<TuningResult | null>(null);
   const [tuningHistory, setTuningHistory] = useState<TuningResult[]>([]);
+  const [tuningSessions, setTuningSessions] = useState<TuningSession[]>([]);
+  const [selectedTuningSessionId, setSelectedTuningSessionId] = useState<string | null>(null);
   const [tuningAvgIterSec, setTuningAvgIterSec] = useState<number | null>(null);
   const [tuningElapsedSec, setTuningElapsedSec] = useState(0);
   const isTuningRef = useRef(false);
   const shouldPauseTuningRef = useRef(false);
   const tuningPausedRef = useRef(false);
   const tuningBestRef = useRef<TuningResult | null>(null);
+  const tuningHistoryRef = useRef<TuningResult[]>([]);
   const tuningStartTimeRef = useRef(0);
   const tuningElapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const tuningSessionIdRef = useRef<string | null>(null);
 
   const showConfirm = (message: string, subMessage: string | undefined, onConfirm: () => void, confirmLabel?: string) => {
     setConfirmDialog({ message, subMessage, onConfirm, confirmLabel });
@@ -648,9 +828,32 @@ function App() {
   const [dialogDefaultPath, setDialogDefaultPath] = useState<string>(() => {
     return localStorage.getItem('heu_dialog_default_path') || '/mnt/c/';
   });
+  const [parallelism, setParallelism] = useState<number>(() => {
+    const saved = localStorage.getItem('heu_parallelism');
+    const parsed = saved ? Number(saved) : NaN;
+    return Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : 3;
+  });
   useEffect(() => {
     localStorage.setItem('heu_dialog_default_path', dialogDefaultPath);
   }, [dialogDefaultPath]);
+  useEffect(() => {
+    localStorage.setItem('heu_parallelism', String(Math.max(1, Math.floor(parallelism))));
+  }, [parallelism]);
+  useEffect(() => {
+    invoke<number>('get_available_parallelism')
+      .then((count) => {
+        const normalized = Math.max(1, Math.floor(count || 1));
+        setLogicalProcessorCount(normalized);
+        const saved = localStorage.getItem('heu_parallelism');
+        if (!saved) setParallelism(Math.max(1, normalized - 1));
+      })
+      .catch(() => {
+        const fallback = Math.max(1, navigator.hardwareConcurrency || 4);
+        setLogicalProcessorCount(fallback);
+        const saved = localStorage.getItem('heu_parallelism');
+        if (!saved) setParallelism(Math.max(1, fallback - 1));
+      });
+  }, []);
 
   const [isProcessing, setIsProcessing] = useState(false);
   const cancelRef = useRef(false);
@@ -686,6 +889,7 @@ function App() {
 
   const [config, setConfig] = useState<ContestConfig | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isGlobalSettingsOpen, setIsGlobalSettingsOpen] = useState(false);
   const [editingConfig, setEditingConfig] = useState<ContestConfig | null>(null);
 
   const [testcaseVars, setTestcaseVars] = useState<Record<number, Record<string, number>>>({});
@@ -697,6 +901,7 @@ function App() {
   const [testCaseSort, setTestCaseSort] = useState<{ key: string; order: 'asc' | 'desc' }>({ key: 'id', order: 'asc' });
   // テストケースごとの入出力展開状態
   const [expandedCaseIO, setExpandedCaseIO] = useState<Record<number, { input: string; output: string; stderr: string } | 'loading'>>({});
+  const [relScoreTooltip, setRelScoreTooltip] = useState<RelScoreTooltip | null>(null);
 
   // ページネーション
   const [subPage, setSubPage] = useState(1);
@@ -708,6 +913,9 @@ function App() {
   // ★ 追加: 統計タブ用のState
   const [selectedForStats, setSelectedForStats] = useState<Set<string>>(new Set());
   const [varFilters, setVarFilters] = useState<Record<string, { min: number | '', max: number | '' }>>({});
+  const [statsScoreMode, setStatsScoreMode] = useState<'absolute' | 'relative'>('absolute');
+  const [statsSubPage, setStatsSubPage] = useState(1);
+  const [statsSubPageSize, setStatsSubPageSize] = useState(20);
   // 統計グラフ上のポイントhoverツールチップ
   const [statsPointTooltip, setStatsPointTooltip] = useState<HoverInfo | null>(null);
   const [currentVisId, setCurrentVisId] = useState<number | null>(null);
@@ -733,6 +941,8 @@ function App() {
   useEffect(() => {
     setSelectedForStats(new Set());
     setVarFilters({});
+    setStatsScoreMode('absolute');
+    setStatsSubPage(1);
   }, [currentContest]);
 
   // 提出の選択が変わったら展開中のIOをリセット
@@ -775,6 +985,11 @@ function App() {
     return Math.round(rel);
   };
 
+  const getScoreByMode = (tc: TestCaseResult, mode: 'absolute' | 'relative') => {
+    if (mode === 'relative') return calcRelativeScore(tc.score, bestScores[tc.id]);
+    return tc.score;
+  };
+
   // 3. 提出一覧（ソート＆相対スコア合計付き）
   const sortedSubmissions = useMemo(() => {
     if (!submissions) return [];
@@ -805,6 +1020,89 @@ function App() {
     });
   }, [submissions, submissionSort, bestScores, config?.optimize_target]);
   // ★ ここまで追加
+
+  const getBestSubmissionsForCase = (caseId: number) => {
+    const bestScore = bestScores[caseId];
+    if (bestScore === undefined) return { bestScore: 0, winners: [] as { id: string; name: string; score: number }[] };
+    const winners = submissions
+      .map(sub => {
+        const tc = sub.testCases?.find(t => t.id === caseId);
+        return tc && tc.score === bestScore ? { id: sub.id, name: sub.name, score: tc.score } : null;
+      })
+      .filter((entry): entry is { id: string; name: string; score: number } => entry !== null);
+    return { bestScore, winners };
+  };
+
+  const persistTuningSessions = (sessions: TuningSession[], contestName: string) => {
+    localStorage.setItem(`heu_tuning_sessions_${contestName}`, JSON.stringify(sessions));
+  };
+
+  const upsertTuningSession = (session: TuningSession) => {
+    if (!currentContest) return;
+    setTuningSessions(prev => {
+      const next = [session, ...prev.filter(s => s.id !== session.id)]
+        .sort((a, b) => b.savedAt - a.savedAt)
+        .slice(0, 30);
+      persistTuningSessions(next, currentContest);
+      return next;
+    });
+    setSelectedTuningSessionId(session.id);
+  };
+
+  const snapshotCurrentTuningSession = (sessionId: string, override?: Partial<TuningSession>) => {
+    const session: TuningSession = {
+      id: sessionId,
+      name: override?.name ?? `履歴 ${new Date().toLocaleString('ja-JP', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}`,
+      savedAt: override?.savedAt ?? Date.now(),
+      code: override?.code ?? tuningCode,
+      params: override?.params ?? tuningParams,
+      testCases: override?.testCases ?? tuningTestCases,
+      history: override?.history ?? tuningHistory,
+      best: override?.best ?? tuningBest,
+    };
+    upsertTuningSession(session);
+  };
+
+  const renameTuningSession = (sessionId: string, name: string) => {
+    if (!currentContest) return;
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setTuningSessions(prev => {
+      const next = prev.map(session => session.id === sessionId ? { ...session, name: trimmed, savedAt: Date.now() } : session);
+      persistTuningSessions(next, currentContest);
+      return next;
+    });
+  };
+
+  const deleteTuningSession = (sessionId: string) => {
+    if (!currentContest) return;
+    setTuningSessions(prev => {
+      const next = prev.filter(session => session.id !== sessionId);
+      persistTuningSessions(next, currentContest);
+      return next;
+    });
+    if (selectedTuningSessionId === sessionId) setSelectedTuningSessionId(null);
+  };
+
+  const canResumeSelectedTuningSession = useMemo(() => {
+    if (!selectedTuningSessionId || tuningHistory.length === 0) return false;
+    const session = tuningSessions.find(s => s.id === selectedTuningSessionId);
+    if (!session) return false;
+    return JSON.stringify({
+      code: tuningCode,
+      testCases: tuningTestCases,
+      params: normalizeTuningParamsForCompare(tuningParams),
+    }) === JSON.stringify({
+      code: session.code,
+      testCases: session.testCases,
+      params: normalizeTuningParamsForCompare(session.params),
+    });
+  }, [selectedTuningSessionId, tuningSessions, tuningHistory, tuningCode, tuningTestCases, tuningParams]);
+
+  const tuningTotalCombos = useMemo(() => {
+    if (tuningParams.length === 0) return 0;
+    return tuningParams.reduce((acc, param) => acc * buildTuningDiscreteValues(param).length, 1);
+  }, [tuningParams]);
 
   const handleSubmissionSort = (key: string) => {
     setSubmissionSort(prev => ({
@@ -837,9 +1135,22 @@ function App() {
       }
       const savedTuning = localStorage.getItem(`heu_tuning_${currentContest}`);
       if (savedTuning) {
-        const { params, testCases: ttc } = JSON.parse(savedTuning);
-        if (params) setTuningParams(params);
+        const { params, testCases: ttc, code: savedCode, selectedSessionId } = JSON.parse(savedTuning);
+        if (params) setTuningParams(params.map((p: TuningParam) => ({ ...p, divisions: p.divisions ?? 5 })));
         if (ttc != null) setTuningTestCases(ttc);
+        if (savedCode != null) setTuningCode(savedCode);
+        if (selectedSessionId != null) setSelectedTuningSessionId(selectedSessionId);
+      } else {
+        setTuningCode(code);
+      }
+      const savedSessions = localStorage.getItem(`heu_tuning_sessions_${currentContest}`);
+      if (savedSessions) {
+        setTuningSessions(JSON.parse(savedSessions).map((session: TuningSession) => ({
+          ...session,
+          params: session.params.map(p => ({ ...p, divisions: p.divisions ?? 5 })),
+        })));
+      } else {
+        setTuningSessions([]);
       }
     } catch {}
     setTimeout(() => { limitsLoadedRef.current = true; }, 150);
@@ -852,8 +1163,21 @@ function App() {
 
   useEffect(() => {
     if (!currentContest || !limitsLoadedRef.current) return;
-    localStorage.setItem(`heu_tuning_${currentContest}`, JSON.stringify({ params: tuningParams, testCases: tuningTestCases }));
-  }, [tuningParams, tuningTestCases, currentContest]);
+    localStorage.setItem(`heu_tuning_${currentContest}`, JSON.stringify({
+      params: tuningParams,
+      testCases: tuningTestCases,
+      code: tuningCode,
+      selectedSessionId: selectedTuningSessionId,
+    }));
+  }, [tuningParams, tuningTestCases, tuningCode, selectedTuningSessionId, currentContest]);
+
+  useEffect(() => {
+    if (!tuningCode) setTuningCode(code);
+  }, [code, tuningCode]);
+
+  useEffect(() => {
+    tuningHistoryRef.current = tuningHistory;
+  }, [tuningHistory]);
   useEffect(() => {
     if (currentContest) {
       invoke<ContestConfig>('get_contest_config', { contestName: currentContest })
@@ -888,6 +1212,10 @@ function App() {
       setEditingConfig({ ...config });
       setIsSettingsOpen(true);
     }
+  };
+
+  const openGlobalSettings = () => {
+    setIsGlobalSettingsOpen(true);
   };
 
   const saveSettings = async () => {
@@ -1055,6 +1383,7 @@ function App() {
     isTuningRef.current = false;
     shouldPauseTuningRef.current = false;
     if (tuningElapsedTimerRef.current) { clearInterval(tuningElapsedTimerRef.current); tuningElapsedTimerRef.current = null; }
+    if (tuningSessionIdRef.current) snapshotCurrentTuningSession(tuningSessionIdRef.current, { savedAt: Date.now() });
     setTuningStatus('idle');
   };
 
@@ -1062,17 +1391,47 @@ function App() {
     if (!currentContest || isTuningRef.current || tuningParams.length === 0) return;
     const isMaximize = config?.optimize_target !== 'minimize';
     const isBetter = (a: number, b: number) => isMaximize ? a > b : a < b;
+    const shouldResume = canResumeSelectedTuningSession;
+    const sessionId = shouldResume ? selectedTuningSessionId! : `tuning_session_${Date.now()}`;
+    const grids = tuningParams.map(param => ({ param, values: buildTuningDiscreteValues(param) }));
+    const candidateKey = (indices: number[]) => indices.join('|');
+    const paramsFromIndices = (indices: number[]) => Object.fromEntries(
+      grids.map((grid, i) => [grid.param.name, grid.values[indices[i]]])
+    ) as Record<string, number>;
+    const indicesFromResult = (result: TuningResult) => grids.map(grid => {
+      const value = result.params[grid.param.name];
+      const exact = grid.values.findIndex(v => v === value);
+      if (exact >= 0) return exact;
+      let bestIdx = 0;
+      let bestDist = Infinity;
+      grid.values.forEach((v, i) => {
+        const dist = Math.abs(v - value);
+        if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+      });
+      return bestIdx;
+    });
+    const allOptions = grids.map(grid => grid.values.map((_, idx) => idx));
+    const coarseOptions = grids.map(grid => {
+      if (grid.values.length <= 3) return grid.values.map((_, idx) => idx);
+      return Array.from(new Set([0, Math.floor((grid.values.length - 1) / 2), grid.values.length - 1]));
+    });
+    const evaluatedKeys = new Set<string>();
+    const coarseResults: { indices: number[]; score: number }[] = [];
 
     isTuningRef.current = true;
     shouldPauseTuningRef.current = false;
     tuningPausedRef.current = false;
-    tuningBestRef.current = null;
+    tuningSessionIdRef.current = sessionId;
+    tuningBestRef.current = shouldResume ? tuningBest : null;
     setTuningStatus('running');
-    setTuningIterCount(0);
-    setTuningBest(null);
-    setTuningHistory([]);
-    setTuningAvgIterSec(null);
-    setTuningElapsedSec(0);
+    if (!shouldResume) {
+      setTuningIterCount(0);
+      setTuningBest(null);
+      setTuningHistory([]);
+      tuningHistoryRef.current = [];
+      setTuningAvgIterSec(null);
+      setTuningElapsedSec(0);
+    }
     tuningStartTimeRef.current = Date.now();
 
     if (tuningElapsedTimerRef.current) clearInterval(tuningElapsedTimerRef.current);
@@ -1080,23 +1439,22 @@ function App() {
       setTuningElapsedSec(Math.floor((Date.now() - tuningStartTimeRef.current) / 1000));
     }, 1000);
 
-    let currentParams: Record<string, number> = {};
-    tuningParams.forEach(p => { currentParams[p.name] = p.currentValue; });
-
-    let iterCount = 0;
+    let iterCount = shouldResume ? Math.max(0, ...tuningHistory.map(h => h.iteration)) : 0;
     const iterTimes: number[] = [];
+    if (shouldResume) {
+      tuningHistory.forEach(result => evaluatedKeys.add(candidateKey(indicesFromResult(result))));
+    }
 
     const evalParams = async (params: Record<string, number>): Promise<number> => {
-      let modifiedCode = code;
-      for (const p of tuningParams) {
-        modifiedCode = replaceConstantInCode(modifiedCode, p.name, params[p.name], p.paramType);
-      }
       const subId = `tuning_${Date.now()}`;
-      await invoke('setup_submission', { contestName: currentContest, code: modifiedCode, language, testCases: tuningTestCases });
+      const execArgs = tuningParams.map(p => {
+        const value = params[p.name];
+        return p.paramType === 'int' ? String(Math.round(value)) : String(value);
+      });
 
       let totalScore = 0;
       const queue = Array.from({ length: tuningTestCases }, (_, i) => i);
-      const concurrency = Math.max(1, (navigator.hardwareConcurrency || 4));
+      const concurrency = Math.max(1, Math.floor(parallelism));
       const runQ = async (q: number[]) => {
         while (q.length > 0 && isTuningRef.current && !shouldPauseTuningRef.current) {
           const i = q.shift();
@@ -1104,7 +1462,7 @@ function App() {
           try {
             const res = await invoke<TestCaseResult>('run_test_case', {
               contestName: currentContest, language, caseId: i,
-              timeLimit, memoryLimit, submissionId: subId,
+              timeLimit, memoryLimit, submissionId: subId, execArgs,
             });
             totalScore += res.score;
           } catch {}
@@ -1115,8 +1473,28 @@ function App() {
       return totalScore;
     };
 
-    while (isTuningRef.current) {
-      // ポーズ待機
+    try {
+      await invoke('setup_submission', { contestName: currentContest, code: tuningCode, language, testCases: tuningTestCases });
+    } catch (e) {
+      if (tuningElapsedTimerRef.current) { clearInterval(tuningElapsedTimerRef.current); tuningElapsedTimerRef.current = null; }
+      setTuningStatus('idle');
+      isTuningRef.current = false;
+      showStatus('error', String(e));
+      return;
+    }
+
+    if (!shouldResume) {
+      snapshotCurrentTuningSession(sessionId, {
+        savedAt: Date.now(),
+        code: tuningCode,
+        params: tuningParams,
+        testCases: tuningTestCases,
+        history: [],
+        best: null,
+      });
+    }
+
+    const waitIfPaused = async () => {
       if (shouldPauseTuningRef.current) {
         tuningPausedRef.current = true;
         setTuningStatus('paused');
@@ -1124,47 +1502,105 @@ function App() {
           await new Promise(r => setTimeout(r, 150));
         }
         tuningPausedRef.current = false;
-        if (!isTuningRef.current) break;
+        if (!isTuningRef.current) return false;
         setTuningStatus('running');
       }
+      return isTuningRef.current;
+    };
 
-      const iterStart = Date.now();
-
-      // 近傍生成
-      const newParams = { ...currentParams };
-      const p = tuningParams[Math.floor(Math.random() * tuningParams.length)];
-      const sign = Math.random() < 0.5 ? 1 : -1;
-      let newVal = newParams[p.name] + sign * p.stepSize * (0.5 + Math.random() * 1.5);
-      newVal = Math.max(p.minValue, Math.min(p.maxValue, newVal));
-      if (p.paramType === 'int') newVal = Math.round(newVal);
-      newParams[p.name] = newVal;
-
-      let score = 0;
-      try { score = await evalParams(newParams); } catch { continue; }
-      if (!isTuningRef.current) break;
-
+    const registerResult = (indices: number[], params: Record<string, number>, score: number, avgTime: number, stage: 'coarse' | 'focus' | 'full') => {
       iterCount++;
-      iterTimes.push((Date.now() - iterStart) / 1000);
-      const avgTime = iterTimes.slice(-10).reduce((a, b) => a + b, 0) / Math.min(iterTimes.length, 10);
-
       const prevBest = tuningBestRef.current;
       const improved = prevBest === null || isBetter(score, prevBest.score);
+      let bestSnapshot = tuningBestRef.current;
       if (improved) {
-        currentParams = { ...newParams };
-        const best: TuningResult = { iteration: iterCount, params: { ...newParams }, score, timestamp: Date.now() };
+        const best: TuningResult = { iteration: iterCount, params: { ...params }, score, timestamp: Date.now() };
         tuningBestRef.current = best;
+        bestSnapshot = best;
         setTuningBest(best);
       }
 
-      const iter: TuningResult = { iteration: iterCount, params: { ...newParams }, score, timestamp: Date.now() };
-      setTuningHistory(prev => [iter, ...prev].slice(0, 100));
+      const iter: TuningResult = { iteration: iterCount, params: { ...params }, score, timestamp: Date.now() };
+      const nextHistory = [iter, ...tuningHistoryRef.current].slice(0, 100);
+      tuningHistoryRef.current = nextHistory;
+      setTuningHistory(nextHistory);
       setTuningIterCount(iterCount);
       setTuningAvgIterSec(avgTime);
+      evaluatedKeys.add(candidateKey(indices));
+      if (stage === 'coarse') coarseResults.push({ indices: [...indices], score });
+      snapshotCurrentTuningSession(sessionId, {
+        savedAt: Date.now(),
+        code: tuningCode,
+        params: tuningParams.map(p => ({ ...p })),
+        testCases: tuningTestCases,
+        history: nextHistory,
+        best: bestSnapshot,
+      });
+    };
+
+    const visitCombinations = async (indexOptions: number[][], stage: 'coarse' | 'focus' | 'full') => {
+      const walk = async (depth: number, indices: number[]) => {
+        if (!isTuningRef.current) return;
+        if (!(await waitIfPaused())) return;
+        if (depth === indexOptions.length) {
+          const key = candidateKey(indices);
+          if (evaluatedKeys.has(key)) return;
+          const iterStart = Date.now();
+          const params = paramsFromIndices(indices);
+          let score = 0;
+          try { score = await evalParams(params); } catch { return; }
+          if (!isTuningRef.current) return;
+          iterTimes.push((Date.now() - iterStart) / 1000);
+          const avgTime = iterTimes.slice(-10).reduce((a, b) => a + b, 0) / Math.min(iterTimes.length, 10);
+          registerResult(indices, params, score, avgTime, stage);
+          return;
+        }
+        for (const idx of indexOptions[depth]) {
+          indices.push(idx);
+          await walk(depth + 1, indices);
+          indices.pop();
+          if (!isTuningRef.current) return;
+        }
+      };
+      await walk(0, []);
+    };
+
+    await visitCombinations(coarseOptions, 'coarse');
+    if (isTuningRef.current) {
+      const topSeeds = [...coarseResults]
+        .sort((a, b) => isMaximize ? b.score - a.score : a.score - b.score)
+        .slice(0, Math.min(5, coarseResults.length));
+      for (const seed of topSeeds) {
+        const focusOptions = grids.map((grid, i) => {
+          const center = seed.indices[i];
+          return Array.from(new Set([center - 1, center, center + 1].filter(idx => idx >= 0 && idx < grid.values.length)));
+        });
+        await visitCombinations(focusOptions, 'focus');
+        if (!isTuningRef.current) break;
+      }
     }
+    if (isTuningRef.current) await visitCombinations(allOptions, 'full');
 
     if (tuningElapsedTimerRef.current) { clearInterval(tuningElapsedTimerRef.current); tuningElapsedTimerRef.current = null; }
     setTuningStatus('idle');
     isTuningRef.current = false;
+    if (iterCount > 0 && !shouldPauseTuningRef.current) showStatus('success', '段階的総当たりチューニングが完了しました');
+  };
+
+  const loadTuningSession = (session: TuningSession) => {
+    if (isTuningRef.current) return;
+    setSelectedTuningSessionId(session.id);
+    setTuningCode(session.code);
+    setTuningParams(session.params.map(p => ({ ...p, divisions: p.divisions ?? 5 })));
+    setTuningTestCases(session.testCases);
+    setTuningHistory(session.history);
+    tuningHistoryRef.current = session.history;
+    setTuningBest(session.best);
+    tuningBestRef.current = session.best;
+    setTuningIterCount(Math.max(0, ...session.history.map(h => h.iteration)));
+    setTuningAvgIterSec(null);
+    setTuningElapsedSec(0);
+    showStatus('success', `履歴「${session.name}」を読み込みました`);
   };
 
   const handleSubmit = async () => {
@@ -1242,7 +1678,7 @@ function App() {
         }
       };
 
-      const concurrency = navigator.hardwareConcurrency ? Math.max(1, navigator.hardwareConcurrency) : 4;
+      const concurrency = Math.max(1, Math.floor(parallelism));
       const queue = Array.from({ length: testCases }, (_, i) => i);
       const workers = [];
       for (let i = 0; i < concurrency; i++) { workers.push(runQueue(queue)); }
@@ -1480,19 +1916,27 @@ function App() {
   const selectedSub = submissions.find(s => s.id === selectedSubId);
 
   return (
-    <div className="min-h-screen flex flex-col bg-gray-50 text-gray-800 font-sans">
+    <div className="h-screen overflow-hidden flex flex-col bg-gray-50 text-gray-800 font-sans">
       <header className="bg-gray-900 text-white p-3 shadow flex justify-between items-center flex-none">
         <div className="flex items-center gap-4">
           <button onClick={() => setCurrentContest(null)} className="hover:bg-gray-700 p-2 rounded"><ArrowLeft size={20} /></button>
           <h1 className="text-lg font-bold flex items-center gap-2"><Code2 size={20} />{currentContest}</h1>
         </div>
-        <button
-          disabled={isProcessing || !currentContest}
-          onClick={openSettings}
-          className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg flex items-center gap-2 font-bold transition-colors disabled:opacity-50"
-        >
-          <Settings size={18} /> コンテスト設定・ケース生成
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={openGlobalSettings}
+            className="px-4 py-2 bg-white/10 hover:bg-white/15 text-white rounded-lg flex items-center gap-2 font-bold transition-colors"
+          >
+            <Settings size={18} /> グローバル設定
+          </button>
+          <button
+            disabled={isProcessing || !currentContest}
+            onClick={openSettings}
+            className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg flex items-center gap-2 font-bold transition-colors disabled:opacity-50"
+          >
+            <Settings size={18} /> コンテスト設定
+          </button>
+        </div>
       </header>
 
       <div className="bg-white border-b border-gray-200 px-6 flex gap-1 pt-3 flex-none">
@@ -1508,11 +1952,13 @@ function App() {
       </div>
 
       {/* 画面を左右に分割するメインエリア */}
-      <main className="flex-1 flex flex-row overflow-hidden w-full">
+      <main className="flex-1 min-h-0 flex flex-row overflow-hidden w-full">
 
         {/* 左側エリア（提出結果・エディタ）— 独立スクロール */}
-        <div className={`flex-1 min-w-0 overflow-y-auto overflow-x-hidden p-4 ${visData ? '' : 'max-w-7xl mx-auto w-full'}`}>
+        <div className="flex-1 min-w-0 min-h-0 overflow-hidden p-4">
           {activeTab === 'submit' && (
+            <div className="h-full min-h-0 overflow-y-auto overflow-x-hidden">
+            <div className={visData ? '' : 'max-w-7xl mx-auto w-full'}>
             <>
             <div className="bg-white border border-gray-300 rounded-lg shadow-sm flex flex-col h-[calc(100vh-140px)] min-h-[500px]">
               <div className="p-3 border-b border-gray-200 flex gap-4 items-center bg-gray-50 rounded-t-lg overflow-x-auto">
@@ -1538,6 +1984,16 @@ function App() {
                 <div className="flex items-center gap-2 whitespace-nowrap">
                   <span className="text-sm font-bold">メモリ(MB):</span>
                   <input type="number" step="128" min="128" value={memoryLimit} onChange={(e) => setMemoryLimit(Number(e.target.value))} className="border rounded p-1.5 w-20 text-sm bg-white" />
+                </div>
+                <div className="flex items-center gap-2 whitespace-nowrap">
+                  <span className="text-sm font-bold">並列数:</span>
+                  <input
+                    type="number"
+                    min="1"
+                    value={parallelism}
+                    onChange={(e) => setParallelism(Math.max(1, Math.floor(Number(e.target.value) || 1)))}
+                    className="border rounded p-1.5 w-16 text-sm bg-white"
+                  />
                 </div>
                 <div className="ml-auto flex items-center gap-2">
                   <CopyButton text={code} className="py-1.5 px-3 text-sm" />
@@ -1569,6 +2025,11 @@ function App() {
                   )}
                 </div>
               </div>
+              {parallelism > logicalProcessorCount && (
+                <div className="px-3 py-2 bg-amber-50 border-b border-amber-200 text-xs text-amber-700 font-bold">
+                  並列数が論理プロセッサ数 ({logicalProcessorCount}) を超えています。処理が遅くなることがあります。
+                </div>
+              )}
               <div className="flex-1 relative">
                 <Editor height="100%" language={language === 'python' ? 'python' : language === 'rust' ? 'rust' : 'cpp'} theme="vs-light" value={code} onChange={(v) => setCode(v || '')}
                   onMount={(editor, monaco) => {
@@ -1625,9 +2086,13 @@ function App() {
               </div>
             )}
           </>
+          </div>
+          </div>
           )}
 
           {activeTab === 'submissions' && (
+            <div className="h-full min-h-0 overflow-y-auto overflow-x-hidden">
+            <div className={visData ? '' : 'max-w-7xl mx-auto w-full'}>
             <div className="bg-white border border-gray-300 rounded-lg shadow-sm p-6 min-h-[500px]">
               {!selectedSubId && (
                 <>
@@ -1748,6 +2213,29 @@ function App() {
 
                   {detailTab === 'results' ? (
                     <div>
+                      {relScoreTooltip && (
+                        <div
+                          className="fixed z-50 pointer-events-none"
+                          style={{ left: relScoreTooltip.x + 12, top: relScoreTooltip.y - 10 }}
+                        >
+                          <div className="bg-gray-900 text-white text-xs rounded-lg px-3 py-2 shadow-lg max-w-72">
+                            <p className="font-bold text-blue-300 mb-1">case {String(relScoreTooltip.caseId).padStart(4, '0')} の最善提出</p>
+                            <p className="text-gray-300 mb-1">best score: {relScoreTooltip.bestScore.toLocaleString()}</p>
+                            {relScoreTooltip.winners.length === 0 ? (
+                              <p className="text-gray-400">該当提出なし</p>
+                            ) : (
+                              <div className="space-y-0.5">
+                                {relScoreTooltip.winners.map(w => (
+                                  <p key={w.id} className="truncate">
+                                    <span className="font-bold text-white">{w.name}</span>
+                                    <span className="text-gray-400"> ({w.score.toLocaleString()})</span>
+                                  </p>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
                       {(() => {
                         const sortedCases = [...(selectedSub.testCases || [])]
                           .filter(r => !showFavoritesOnly || favorites.has(r.id))
@@ -1794,6 +2282,7 @@ function App() {
                             <tbody>
                               {pagedCases.map((r) => {
                                 const relScore = calcRelativeScore(r.score, bestScores[r.id]);
+                                const bestForCase = getBestSubmissionsForCase(r.id);
                                 return (
                                   <React.Fragment key={r.id}>
                                     <tr className={`border-b hover:bg-gray-50 ${visData && r.id === Number(visData.input.match(/Case: (\d+)/)?.[1] || r.id) ? 'bg-blue-50' : ''}`}>
@@ -1808,7 +2297,24 @@ function App() {
                                       <td className="p-3 text-center">{getStatusBadge(r.status)}</td>
                                       <td className="p-3 font-mono text-right text-gray-600">{r.time.toFixed(3)}s</td>
                                       <td className="p-3 font-mono text-right font-bold">{r.score > 0 ? r.score.toLocaleString() : '-'}</td>
-                                      <td className="p-3 font-mono text-right font-bold text-blue-600">{relScore.toLocaleString()}</td>
+                                      <td className="p-3 text-right">
+                                        <span
+                                          className="inline-block font-mono font-bold text-blue-600 border-b border-dotted border-blue-300 cursor-help"
+                                          onMouseEnter={(e) => {
+                                            const rect = e.currentTarget.getBoundingClientRect();
+                                            setRelScoreTooltip({
+                                              caseId: r.id,
+                                              x: rect.right,
+                                              y: rect.top + rect.height / 2,
+                                              bestScore: bestForCase.bestScore,
+                                              winners: bestForCase.winners,
+                                            });
+                                          }}
+                                          onMouseLeave={() => setRelScoreTooltip(prev => prev?.caseId === r.id ? null : prev)}
+                                        >
+                                          {relScore.toLocaleString()}
+                                        </span>
+                                      </td>
                                       <td className="p-3 text-center">
                                         <button onClick={() => openVisualizer(r.id, selectedSub.id)} className="text-gray-600 hover:text-blue-600 p-1 hover:bg-blue-50 rounded transition-colors" title="アプリ内でビジュアライザを再生"><Play size={18} /></button>
                                       </td>
@@ -1892,11 +2398,14 @@ function App() {
                 </div>
               )}
             </div>
+            </div>
+            </div>
           )}
 
           {/* ★ ここから追加：統計タブ */}
           {activeTab === 'stats' && (
-            <div className="flex-1 overflow-auto p-6 bg-gray-50 flex flex-col gap-6 relative">
+            <div className="h-full min-h-0 overflow-y-auto overflow-x-hidden p-6 bg-gray-50 flex flex-col gap-6 relative">
+              <div className={visData ? '' : 'max-w-7xl mx-auto w-full'}>
               {/* ポイントホバー用フローティングツールチップ */}
               {statsPointTooltip && (
                 <div
@@ -1907,12 +2416,12 @@ function App() {
                 </div>
               )}
 
-              <h2 className="text-2xl font-bold flex items-center gap-2 text-gray-800">
+              <h2 className="text-2xl font-bold flex items-center gap-2 text-gray-800 shrink-0">
                 <BarChart2 size={28} className="text-blue-600" /> 統計・分析
               </h2>
 
               {/* ── 提出選択パネル ── */}
-              <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+              <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden shrink-0">
                 <div className="p-3 bg-gray-50 border-b flex items-center justify-between">
                   <h3 className="font-bold text-gray-700">比較する提出を選択</h3>
                   {selectedForStats.size > 0 && (
@@ -1922,45 +2431,56 @@ function App() {
                 {submissions.length === 0 ? (
                   <p className="text-sm text-gray-400 p-4">提出がありません</p>
                 ) : (
-                  <table className="w-full text-left text-sm whitespace-nowrap">
-                    <thead>
-                      <tr className="bg-gray-50 border-b text-gray-500 text-xs">
-                        <th className="py-2 px-3 font-normal w-8"></th>
-                        <th className="py-2 px-3 font-normal w-36">提出日時</th>
-                        <th className="py-2 px-3 font-normal">コード名</th>
-                        <th className="py-2 px-3 font-normal text-right">得点</th>
-                        <th className="py-2 px-3 font-normal text-right">相対スコア</th>
-                        <th className="py-2 px-3 font-normal text-center">結果</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {sortedSubmissions.map((sub: any) => {
-                        const checked = selectedForStats.has(sub.id);
-                        const colorIdx = Array.from(selectedForStats).indexOf(sub.id);
-                        const color = checked ? CHART_COLORS[colorIdx % CHART_COLORS.length] : undefined;
-                        return (
-                          <tr
-                            key={sub.id}
-                            className={`border-b last:border-0 cursor-pointer transition-colors ${checked ? 'bg-blue-50 hover:bg-blue-100' : 'hover:bg-gray-50'}`}
-                            onClick={() => {
-                              const next = new Set(selectedForStats);
-                              checked ? next.delete(sub.id) : next.add(sub.id);
-                              setSelectedForStats(next);
-                            }}
-                          >
-                            <td className="py-2 px-3">
-                              <div className="w-3 h-3 rounded-full border-2 transition-all" style={checked ? { background: color, borderColor: color } : { borderColor: '#d1d5db' }} />
-                            </td>
-                            <td className="py-2 px-3 text-gray-500">{sub.time}</td>
-                            <td className="py-2 px-3 font-bold" style={checked ? { color } : { color: '#374151' }}>{sub.name}</td>
-                            <td className="py-2 px-3 font-mono text-right text-blue-600 font-bold">{sub.totalScore.toLocaleString()}</td>
-                            <td className="py-2 px-3 font-mono text-right text-blue-600 font-bold">{sub.totalRelScore.toLocaleString()}</td>
-                            <td className="py-2 px-3 text-center">{getStatusBadge(sub.status)}</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
+                  <>
+                    <table className="w-full text-left text-sm whitespace-nowrap">
+                      <thead>
+                        <tr className="bg-gray-50 border-b text-gray-500 text-xs">
+                          <th className="py-2 px-3 font-normal w-8"></th>
+                          <th className="py-2 px-3 font-normal w-36">提出日時</th>
+                          <th className="py-2 px-3 font-normal">コード名</th>
+                          <th className="py-2 px-3 font-normal text-right">得点</th>
+                          <th className="py-2 px-3 font-normal text-right">相対スコア</th>
+                          <th className="py-2 px-3 font-normal text-center">結果</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {sortedSubmissions.slice((statsSubPage - 1) * statsSubPageSize, statsSubPage * statsSubPageSize).map((sub: any) => {
+                          const checked = selectedForStats.has(sub.id);
+                          const colorIdx = Array.from(selectedForStats).indexOf(sub.id);
+                          const color = checked ? CHART_COLORS[colorIdx % CHART_COLORS.length] : undefined;
+                          return (
+                            <tr
+                              key={sub.id}
+                              className={`border-b last:border-0 cursor-pointer transition-colors ${checked ? 'bg-blue-50 hover:bg-blue-100' : 'hover:bg-gray-50'}`}
+                              onClick={() => {
+                                const next = new Set(selectedForStats);
+                                checked ? next.delete(sub.id) : next.add(sub.id);
+                                setSelectedForStats(next);
+                              }}
+                            >
+                              <td className="py-2 px-3">
+                                <div className="w-3 h-3 rounded-full border-2 transition-all" style={checked ? { background: color, borderColor: color } : { borderColor: '#d1d5db' }} />
+                              </td>
+                              <td className="py-2 px-3 text-gray-500">{sub.time}</td>
+                              <td className="py-2 px-3 font-bold" style={checked ? { color } : { color: '#374151' }}>{sub.name}</td>
+                              <td className="py-2 px-3 font-mono text-right text-blue-600 font-bold">{sub.totalScore.toLocaleString()}</td>
+                              <td className="py-2 px-3 font-mono text-right text-blue-600 font-bold">{sub.totalRelScore.toLocaleString()}</td>
+                              <td className="py-2 px-3 text-center">{getStatusBadge(sub.status)}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                    <div className="px-3">
+                      <Pagination
+                        page={statsSubPage}
+                        total={sortedSubmissions.length}
+                        pageSize={statsSubPageSize}
+                        onPage={setStatsSubPage}
+                        onPageSize={setStatsSubPageSize}
+                      />
+                    </div>
+                  </>
                 )}
               </div>
 
@@ -1978,12 +2498,26 @@ function App() {
                 // 選択順で色が固定されるようにインデックスを管理
                 const subColorMap: Record<string, number> = {};
                 Array.from(selectedForStats).forEach((id, i) => { subColorMap[id] = i; });
+                const scoreModeLabel = statsScoreMode === 'absolute' ? '絶対スコア' : '相対スコア';
 
                 return (
                   <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
                     {/* 左カラム：フィルタ設定 */}
                     <div className="lg:col-span-1 bg-white p-4 rounded-xl shadow-sm border border-gray-200 h-fit space-y-4">
                       <h3 className="font-bold text-gray-700 border-b pb-2">X軸・フィルター</h3>
+                      <div>
+                        <label className="text-xs font-bold text-gray-500 uppercase tracking-wide mb-1 block">Y軸</label>
+                        <div className="flex gap-1">
+                          <button
+                            onClick={() => setStatsScoreMode('absolute')}
+                            className={`flex-1 py-1.5 text-xs font-bold rounded transition-colors ${statsScoreMode === 'absolute' ? 'bg-emerald-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
+                          >絶対スコア</button>
+                          <button
+                            onClick={() => setStatsScoreMode('relative')}
+                            className={`flex-1 py-1.5 text-xs font-bold rounded transition-colors ${statsScoreMode === 'relative' ? 'bg-emerald-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
+                          >相対スコア</button>
+                        </div>
+                      </div>
                       {/* X軸モード */}
                       <div>
                         <label className="text-xs font-bold text-gray-500 uppercase tracking-wide mb-1 block">X軸</label>
@@ -2027,9 +2561,9 @@ function App() {
                       {statsXAxisMode === 'auto' && (
                         <>
                           <h3 className="font-bold text-gray-700 border-b pb-2 pt-1">変数フィルター</h3>
-                          {activeVars.length === 0 ? <p className="text-sm text-gray-500">変数がありません</p> : activeVars.map(v => (
+                          {[SCORE_FILTER_KEY, ...activeVars].map(v => (
                             <div key={v} className="space-y-1">
-                              <label className="text-sm font-bold text-gray-600">{v}</label>
+                              <label className="text-sm font-bold text-gray-600">{v === SCORE_FILTER_KEY ? '絶対スコア' : v}</label>
                               <div className="flex items-center gap-2">
                                 <input type="number" placeholder="Min" className="w-full border p-1.5 text-sm rounded"
                                   value={varFilters[v]?.min ?? ''}
@@ -2041,6 +2575,7 @@ function App() {
                               </div>
                             </div>
                           ))}
+                          {activeVars.length === 0 && <p className="text-sm text-gray-500">変数がないため、絶対スコアのみ絞り込めます</p>}
                         </>
                       )}
                     </div>
@@ -2067,9 +2602,10 @@ function App() {
                               return true;
                             })
                             .map((tc: any) => {
-                              if (tc.score < globalYMin) globalYMin = tc.score;
-                              if (tc.score > globalYMax) globalYMax = tc.score;
-                              return { id: tc.id, score: tc.score };
+                              const score = getScoreByMode(tc, statsScoreMode);
+                              if (score < globalYMin) globalYMin = score;
+                              if (score > globalYMax) globalYMax = score;
+                              return { id: tc.id, score };
                             });
                           return { subId: sub.id, subName: sub.name, data };
                         });
@@ -2081,7 +2617,7 @@ function App() {
                           <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
                             <div className="flex justify-between items-end mb-3 border-b pb-2 flex-wrap gap-2">
                               <h3 className="font-bold text-lg text-gray-800">
-                                seed vs 絶対スコア
+                                {`seed vs ${scoreModeLabel}`}
                                 <span className="text-xs bg-blue-100 text-blue-600 px-2 py-1 rounded ml-2">折れ線</span>
                               </h3>
                               <div className="flex gap-4">
@@ -2123,12 +2659,17 @@ function App() {
                             const fMin = varFilters[v]?.min, fMax = varFilters[v]?.max;
                             if (typeof fMin === 'number' && val < fMin) return;
                             if (typeof fMax === 'number' && val > fMax) return;
+                            const scoreFilterMin = varFilters[SCORE_FILTER_KEY]?.min;
+                            const scoreFilterMax = varFilters[SCORE_FILTER_KEY]?.max;
+                            if (typeof scoreFilterMin === 'number' && tc.score < scoreFilterMin) return;
+                            if (typeof scoreFilterMax === 'number' && tc.score > scoreFilterMax) return;
+                            const score = getScoreByMode(tc, statsScoreMode);
                             uniqueValues.add(val);
-                            subData.push({ x: val, y: tc.score, id: tc.id });
+                            subData.push({ x: val, y: score, id: tc.id });
                             if (!boxMap[val]) boxMap[val] = [];
-                            boxMap[val].push({ score: tc.score, id: tc.id });
-                            if (tc.score < globalYMin) globalYMin = tc.score;
-                            if (tc.score > globalYMax) globalYMax = tc.score;
+                            boxMap[val].push({ score, id: tc.id });
+                            if (score < globalYMin) globalYMin = score;
+                            if (score > globalYMax) globalYMax = score;
                           });
                           const corr = calcCorrelation(subData.map(d => d.x), subData.map(d => d.y));
                           return { subName: sub.name, subId: sub.id, corr, data: subData, boxMap };
@@ -2165,9 +2706,13 @@ function App() {
                                   const fMin = varFilters[v]?.min, fMax = varFilters[v]?.max;
                                   if (typeof fMin === 'number' && val < fMin) return false;
                                   if (typeof fMax === 'number' && val > fMax) return false;
+                                  const scoreFilterMin = varFilters[SCORE_FILTER_KEY]?.min;
+                                  const scoreFilterMax = varFilters[SCORE_FILTER_KEY]?.max;
+                                  if (typeof scoreFilterMin === 'number' && tc.score < scoreFilterMin) return false;
+                                  if (typeof scoreFilterMax === 'number' && tc.score > scoreFilterMax) return false;
                                   return true;
                                 })
-                                .map((tc: any) => ({ score: tc.score, id: tc.id })) || [];
+                                .map((tc: any) => ({ score: getScoreByMode(tc, statsScoreMode), id: tc.id })) || [];
                               const stats = calcBoxStatsWithIds(entries);
                               row[`s${colorIdx}_min`] = stats.min; row[`s${colorIdx}_minId`] = stats.minId;
                               row[`s${colorIdx}_q1`] = stats.q1; row[`s${colorIdx}_q1Id`] = stats.q1Id;
@@ -2183,7 +2728,7 @@ function App() {
                             <div key={v} className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
                               <div className="flex justify-between items-end mb-3 border-b pb-2 flex-wrap gap-2">
                                 <h3 className="font-bold text-lg text-gray-800">
-                                  {v} vs 絶対スコア
+                                  {`${v} vs ${scoreModeLabel}`}
                                   <span className="text-xs bg-gray-200 text-gray-600 px-2 py-1 rounded ml-2">箱ひげ図</span>
                                 </h3>
                                 <div className="flex gap-4">
@@ -2219,7 +2764,7 @@ function App() {
                         return (
                           <div key={v} className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
                             <div className="flex justify-between items-end mb-3 border-b pb-2 flex-wrap gap-2">
-                              <h3 className="font-bold text-lg text-gray-800">{v} vs 絶対スコア</h3>
+                              <h3 className="font-bold text-lg text-gray-800">{`${v} vs ${scoreModeLabel}`}</h3>
                               <div className="text-sm">
                                 <table className="min-w-[200px] text-right">
                                   <thead><tr className="text-gray-500"><th className="font-normal pr-4">提出</th><th className="font-normal">相関係数</th></tr></thead>
@@ -2254,7 +2799,7 @@ function App() {
 
                       {/* ── 提出ごとのサマリーテーブル ── */}
                       <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
-                        <h3 className="font-bold text-lg text-gray-800 mb-1 border-b pb-2">提出サマリー（全テストケース）</h3>
+                        <h3 className="font-bold text-lg text-gray-800 mb-1 border-b pb-2">{`提出サマリー（全テストケース / ${scoreModeLabel}）`}</h3>
                         <p className="text-xs text-gray-400 mb-3">最大・Q3・中央値・Q1・最小はクリックでビジュアライザを開きます</p>
                         <div className="overflow-x-auto">
                           <table className="w-full text-sm text-right">
@@ -2274,7 +2819,7 @@ function App() {
                             <tbody>
                               {compareSubmissions.map((sub) => {
                                 const ci = subColorMap[sub.id] ?? 0;
-                                const entries = sub.testCases?.map(tc => ({ score: tc.score, id: tc.id })) || [];
+                                const entries = sub.testCases?.map(tc => ({ score: getScoreByMode(tc, statsScoreMode), id: tc.id })) || [];
                                 const st = calcBoxStatsWithIds(entries);
                                 const fmt = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 1 });
                                 const VisTd = ({ score, id, bold }: { score: number; id: number; bold?: boolean }) => (
@@ -2309,13 +2854,15 @@ function App() {
                   </div>
                 );
               })()}
+              </div>
             </div>
           )}
           {/* ★ ここまで追加 */}
 
           {/* ── 定数チューニングタブ ── */}
           {activeTab === 'tuning' && (
-            <div className="flex-1 overflow-auto p-6 bg-gray-50">
+            <div className="h-full min-h-0 overflow-y-auto overflow-x-hidden p-6 bg-gray-50">
+              <div className={visData ? '' : 'max-w-7xl mx-auto w-full'}>
               <h2 className="text-2xl font-bold flex items-center gap-2 text-gray-800 mb-6">
                 <Sliders size={28} className="text-purple-600" /> 定数チューニング
                 {tuningStatus === 'running' && <span className="text-sm font-normal text-green-600 flex items-center gap-1"><span className="w-2 h-2 bg-green-500 rounded-full animate-pulse inline-block" /> バックグラウンド実行中</span>}
@@ -2327,13 +2874,103 @@ function App() {
                 {/* ── 左: 設定パネル ── */}
                 <div className="xl:col-span-1 flex flex-col gap-4">
 
+                  <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
+                    <div className="flex items-center justify-between mb-3 border-b pb-2">
+                      <h3 className="font-bold text-gray-700">チューニング用コード</h3>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={async () => {
+                            try {
+                              let text = '';
+                              try { text = await readText() || ''; } catch {}
+                              if (!text) text = clipboardCacheRef.current;
+                              if (text) setTuningCode(text);
+                            } catch (err) { console.error('貼り付け失敗:', err); }
+                          }}
+                          className="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 border border-gray-200 rounded-lg text-xs font-bold transition-colors"
+                        >
+                          貼り付け
+                        </button>
+                        <CopyButton text={tuningCode} className="px-3 py-1.5" />
+                      </div>
+                    </div>
+                    <textarea
+                      value={tuningCode}
+                      onChange={e => setTuningCode(e.target.value)}
+                      className="w-full h-56 border border-gray-300 rounded-lg p-3 text-xs font-mono bg-white focus:ring-1 focus:ring-purple-400 outline-none"
+                      placeholder="定数チューニング専用のコードを貼り付け"
+                    />
+                    <p className="text-xs text-gray-400 mt-2">通常の提出コードとは別管理です。ここに貼ったコードでチューニングを回します。</p>
+                  </div>
+
+                  <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
+                    <div className="flex items-center justify-between mb-3 border-b pb-2">
+                      <h3 className="font-bold text-gray-700">履歴</h3>
+                      {tuningHistory.length > 0 && (
+                        <button
+                          onClick={() => snapshotCurrentTuningSession(selectedTuningSessionId ?? `tuning_session_${Date.now()}`, { savedAt: Date.now() })}
+                          className="px-3 py-1.5 bg-purple-50 hover:bg-purple-100 text-purple-700 border border-purple-200 rounded-lg text-xs font-bold transition-colors"
+                        >
+                          現在状態を保存
+                        </button>
+                      )}
+                    </div>
+                    {tuningSessions.length === 0 ? (
+                      <p className="text-sm text-gray-400 text-center py-4">保存済み履歴はありません</p>
+                    ) : (
+                      <div className="space-y-2 max-h-64 overflow-y-auto">
+                        {tuningSessions.map(session => {
+                          const selected = session.id === selectedTuningSessionId;
+                          return (
+                            <button
+                              key={session.id}
+                              onClick={() => loadTuningSession(session)}
+                              className={`w-full text-left rounded-lg border p-3 transition-colors ${selected ? 'border-purple-300 bg-purple-50' : 'border-gray-200 bg-white hover:bg-gray-50'}`}
+                            >
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="flex-1 min-w-0">
+                                  <input
+                                    type="text"
+                                    value={session.name}
+                                    onClick={e => e.stopPropagation()}
+                                    onChange={e => {
+                                      const value = e.target.value;
+                                      setTuningSessions(prev => prev.map(s => s.id === session.id ? { ...s, name: value } : s));
+                                    }}
+                                    onBlur={e => renameTuningSession(session.id, e.target.value || session.name)}
+                                    className={`w-full bg-transparent border-b border-transparent hover:border-gray-300 focus:border-purple-400 focus:outline-none text-sm font-bold ${selected ? 'text-purple-700' : 'text-gray-700'}`}
+                                  />
+                                </div>
+                                <div className="flex items-center gap-1 shrink-0">
+                                  <span className="text-[11px] text-gray-400">{new Date(session.savedAt).toLocaleString('ja-JP', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
+                                  <button
+                                    onClick={e => {
+                                      e.stopPropagation();
+                                      deleteTuningSession(session.id);
+                                    }}
+                                    className="p-1 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded transition-colors"
+                                    title="削除"
+                                  >
+                                    <Trash2 size={13} />
+                                  </button>
+                                </div>
+                              </div>
+                              <p className="text-xs text-gray-500 mt-1">best: {session.best ? session.best.score.toLocaleString() : '--'} / iter: {Math.max(0, ...session.history.map(h => h.iteration))}</p>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                    <p className="text-xs text-gray-400 mt-2">履歴を選んでも、コード・対象定数・実行設定が変わっていれば新しい履歴として開始します。</p>
+                  </div>
+
                   {/* 自動検出 */}
                   <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
                     <div className="flex items-center justify-between mb-3 border-b pb-2">
                       <h3 className="font-bold text-gray-700 flex items-center gap-2"><Zap size={16} className="text-yellow-500" /> 定数を検出</h3>
                       <button
                         onClick={() => {
-                          const detected = detectConstantsFromCode(code);
+                          const detected = detectConstantsFromCode(tuningCode);
                           if (detected.length === 0) { showStatus('error', '大文字の定数が見つかりませんでした。手動で追加してください。'); return; }
                           setTuningParams(prev => {
                             const existNames = new Set(prev.map(p => p.name));
@@ -2347,7 +2984,7 @@ function App() {
                         <RefreshCw size={12} /> コードから検出
                       </button>
                     </div>
-                    <p className="text-xs text-gray-400">コードの「コード提出」タブの現在のコードから大文字定数 (<code>CONST_NAME = 値</code>) を自動検出します。</p>
+                    <p className="text-xs text-gray-400">上のチューニング用コードから大文字定数 (<code>CONST_NAME = 値</code>) を自動検出します。</p>
                   </div>
 
                   {/* 手動追加 */}
@@ -2356,7 +2993,7 @@ function App() {
                       <h3 className="font-bold text-gray-700">チューニング対象</h3>
                       <button
                         onClick={() => setTuningParams(prev => [...prev, {
-                          id: `param_${Date.now()}`, name: '', currentValue: 100, minValue: 10, maxValue: 1000, stepSize: 10, paramType: 'int'
+                          id: `param_${Date.now()}`, name: '', currentValue: 100, minValue: 10, maxValue: 1000, divisions: 5, paramType: 'int'
                         }])}
                         className="px-3 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 rounded-lg text-xs font-bold transition-colors flex items-center gap-1"
                       >
@@ -2384,12 +3021,53 @@ function App() {
                               </select>
                               <button onClick={() => setTuningParams(prev => prev.filter((_, j) => j !== i))} className="text-red-400 hover:text-red-600 p-1 rounded hover:bg-red-50 transition-colors"><Trash2 size={13} /></button>
                             </div>
-                            <div className="grid grid-cols-4 gap-1.5">
+                            <TuningRangeSlider
+                              param={p}
+                              onChange={(next) => setTuningParams(prev => prev.map((x, j) => {
+                                if (j !== i) return x;
+                                const merged = { ...x, ...next };
+                                if (merged.currentValue < merged.minValue) merged.currentValue = merged.minValue;
+                                if (merged.currentValue > merged.maxValue) merged.currentValue = merged.maxValue;
+                                return merged;
+                              }))}
+                            />
+                            <div className="grid grid-cols-3 gap-1.5 mt-3">
                               {[
                                 ['現在値', 'currentValue'],
+                                ['自動ステップ', 'autoStep'],
+                                ['分割数', 'divisions'],
+                              ].map(([label, key]) => (
+                                <div key={key}>
+                                  <p className="text-gray-400 mb-0.5">{label}</p>
+                                  {key === 'autoStep' ? (
+                                    <div className="w-full border border-gray-200 rounded px-1.5 py-1 text-xs bg-gray-100 font-mono text-gray-600">
+                                      {p.paramType === 'float' ? getTuningStepSize(p).toFixed(4).replace(/\.?0+$/, '') : getTuningStepSize(p).toLocaleString()}
+                                    </div>
+                                  ) : (
+                                    <input
+                                      type="number"
+                                      min={key === 'divisions' ? 1 : undefined}
+                                      step={key === 'divisions' ? '1' : p.paramType === 'float' ? '0.01' : '1'}
+                                      value={(p as any)[key]}
+                                      onChange={e => setTuningParams(prev => prev.map((x, j) => {
+                                        if (j !== i) return x;
+                                        const raw = key === 'divisions'
+                                          ? Math.max(1, parseInt(e.target.value) || 1)
+                                          : p.paramType === 'float'
+                                            ? parseFloat(e.target.value) || 0
+                                            : parseInt(e.target.value) || 0;
+                                        return { ...x, [key]: raw };
+                                      }))}
+                                      className="w-full border border-gray-300 rounded px-1.5 py-1 text-xs bg-white font-mono focus:ring-1 focus:ring-blue-400 outline-none"
+                                    />
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                            <div className="grid grid-cols-2 gap-1.5 mt-2">
+                              {[
                                 ['最小', 'minValue'],
                                 ['最大', 'maxValue'],
-                                ['ステップ', 'stepSize'],
                               ].map(([label, key]) => (
                                 <div key={key}>
                                   <p className="text-gray-400 mb-0.5">{label}</p>
@@ -2397,11 +3075,22 @@ function App() {
                                     type="number"
                                     step={p.paramType === 'float' ? '0.01' : '1'}
                                     value={(p as any)[key]}
-                                    onChange={e => setTuningParams(prev => prev.map((x, j) => j === i ? { ...x, [key]: p.paramType === 'float' ? parseFloat(e.target.value) || 0 : parseInt(e.target.value) || 0 } : x))}
+                                    onChange={e => setTuningParams(prev => prev.map((x, j) => {
+                                      if (j !== i) return x;
+                                      const value = p.paramType === 'float' ? parseFloat(e.target.value) || 0 : parseInt(e.target.value) || 0;
+                                      const merged = { ...x, [key]: value };
+                                      if (merged.minValue > merged.maxValue) {
+                                        if (key === 'minValue') merged.maxValue = value;
+                                        else merged.minValue = value;
+                                      }
+                                      if (merged.currentValue < merged.minValue) merged.currentValue = merged.minValue;
+                                      if (merged.currentValue > merged.maxValue) merged.currentValue = merged.maxValue;
+                                      return merged;
+                                    }))}
                                     className="w-full border border-gray-300 rounded px-1.5 py-1 text-xs bg-white font-mono focus:ring-1 focus:ring-blue-400 outline-none"
                                   />
                                 </div>
-              ))}
+                              ))}
                             </div>
                           </div>
                         ))}
@@ -2421,16 +3110,35 @@ function App() {
                         />
                         <p className="text-xs text-gray-400 mt-1">現在の提出設定: {testCases} ケース</p>
                       </div>
+                      <div>
+                        <label className="text-xs font-bold text-gray-500 block mb-1">並列数</label>
+                        <input
+                          type="number"
+                          min={1}
+                          value={parallelism}
+                          onChange={e => setParallelism(Math.max(1, Math.floor(Number(e.target.value) || 1)))}
+                          className="border rounded p-1.5 w-full text-sm bg-white font-mono"
+                        />
+                        <p className="text-xs text-gray-400 mt-1">既定値は 論理プロセッサ数 ({logicalProcessorCount}) - 1 です。</p>
+                        {parallelism > logicalProcessorCount && (
+                          <p className="text-xs text-amber-600 font-bold mt-1">論理プロセッサ数を超えています。処理能力が下がることがあります。</p>
+                        )}
+                      </div>
+                      <div className="rounded-lg bg-gray-50 border border-gray-200 px-3 py-2">
+                        <p className="text-xs font-bold text-gray-500">総組み合わせ数</p>
+                        <p className="text-lg font-mono font-bold text-purple-700">{tuningTotalCombos.toLocaleString()}</p>
+                        <p className="text-[11px] text-gray-400 mt-0.5">粗く探索してから有望領域を先に細かく見て、その後に残りを回します。</p>
+                      </div>
                     </div>
 
                     <div className="mt-4 flex gap-2">
                       {tuningStatus === 'idle' ? (
                         <button
                           onClick={startTuning}
-                          disabled={tuningParams.length === 0 || tuningParams.some(p => !p.name.trim())}
+                          disabled={tuningCode.trim().length === 0 || tuningParams.length === 0 || tuningParams.some(p => !p.name.trim())}
                           className="flex-1 px-4 py-2.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-40 text-white font-bold rounded-lg flex items-center justify-center gap-2 transition-colors shadow-sm"
                         >
-                          <Zap size={16} /> チューニング開始
+                          <Zap size={16} /> {canResumeSelectedTuningSession ? 'チューニング再開' : 'チューニング開始'}
                         </button>
                       ) : (
                         <button
@@ -2469,21 +3177,10 @@ function App() {
                     <div className="bg-white rounded-xl shadow-sm border border-purple-200 p-4">
                       <div className="flex items-center justify-between mb-3 border-b border-purple-100 pb-2">
                         <h3 className="font-bold text-purple-700 flex items-center gap-2"><TrendingUp size={16} /> ベスト構成 (iter {tuningBest.iteration})</h3>
-                        <button
-                          onClick={() => {
-                            let newCode = code;
-                            tuningParams.forEach(p => {
-                              const val = tuningBest!.params[p.name];
-                              if (val !== undefined) newCode = replaceConstantInCode(newCode, p.name, val, p.paramType);
-                            });
-                            setCode(newCode);
-                            setActiveTab('submit');
-                            showStatus('success', 'ベスト値をコードに反映しました');
-                          }}
-                          className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold rounded-lg transition-colors flex items-center gap-1"
-                        >
-                          <Check size={12} /> コードに反映
-                        </button>
+                        <CopyButton
+                          text={buildCodeWithTuningParams(tuningCode, tuningParams, tuningBest.params)}
+                          className="px-3 py-1.5"
+                        />
                       </div>
                       <div className="flex flex-wrap gap-3">
                         {tuningParams.map(p => (
@@ -2576,6 +3273,7 @@ function App() {
                   </div>
                 </div>
               </div>
+              </div>
             </div>
           )}
 
@@ -2584,15 +3282,15 @@ function App() {
         {/* ★ ここから追加：設定＆ケース生成モーダル */}
         {isSettingsOpen && editingConfig && (
           <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-8 backdrop-blur-sm">
-            <div className="bg-white rounded-xl shadow-2xl w-full max-w-xl overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+            <div className="bg-white rounded-xl shadow-2xl w-full max-w-xl max-h-[85vh] overflow-hidden animate-in fade-in zoom-in-95 duration-200 flex flex-col">
               <div className="p-4 bg-gray-100 border-b flex justify-between items-center">
                 <h3 className="text-lg font-bold flex items-center gap-2 text-gray-800">
                   <Settings size={20} className="text-gray-600" />
-                  {currentContest} の設定
+                  {currentContest} のコンテスト設定
                 </h3>
               </div>
 
-              <div className="p-6 space-y-6">
+              <div className="p-6 space-y-6 overflow-y-auto">
                 {/* ★ 追加: コンテスト名の変更欄 */}
                 <div>
                   <label className="block text-sm font-bold text-gray-700 mb-1">コンテスト名</label>
@@ -2668,8 +3366,45 @@ function App() {
                   </button>
                 </div>
 
-                {/* ファイルダイアログ初期フォルダ */}
+                {/* ケース生成機能 */}
                 <div className="pt-4 border-t">
+                  <label className="block text-sm font-bold text-gray-700 mb-2">テストケース再生成 (tools/gen)</label>
+                  <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-2 bg-gray-100 p-2 rounded-lg border border-gray-300">
+                      <span className="text-sm font-bold text-gray-600">Cases:</span>
+                      <input type="number" min="1" max="1000" value={testCases} onChange={e => setTestCases(Number(e.target.value))} className="w-16 bg-transparent outline-none font-bold text-gray-800" />
+                    </div>
+                    <button
+                      onClick={() => { handleGenerateInputs(); setIsSettingsOpen(false); }}
+                      className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg flex items-center gap-2 font-bold shadow-sm transition-colors"
+                    >
+                      <Plus size={16} /> 生成を実行
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="p-4 border-t bg-gray-50 flex justify-end gap-3">
+                <button onClick={() => setIsSettingsOpen(false)} className="px-5 py-2 font-bold text-gray-600 bg-gray-200 hover:bg-gray-300 rounded-lg transition-colors">キャンセル</button>
+                <button onClick={saveSettings} className="px-5 py-2 font-bold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-md transition-colors flex items-center gap-2">
+                  <Settings size={18} /> 設定を保存
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {isGlobalSettingsOpen && (
+          <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-8 backdrop-blur-sm">
+            <div className="bg-white rounded-xl shadow-2xl w-full max-w-xl max-h-[85vh] overflow-hidden animate-in fade-in zoom-in-95 duration-200 flex flex-col">
+              <div className="p-4 bg-gray-100 border-b flex justify-between items-center">
+                <h3 className="text-lg font-bold flex items-center gap-2 text-gray-800">
+                  <Settings size={20} className="text-gray-600" />
+                  グローバル設定
+                </h3>
+              </div>
+
+              <div className="p-6 space-y-6 overflow-y-auto">
+                <div>
                   <label className="block text-sm font-bold text-gray-700 mb-1">
                     ファイルダイアログの初期フォルダ
                   </label>
@@ -2698,34 +3433,30 @@ function App() {
                       D: ドライブ
                     </button>
                   </div>
-                  <p className="text-xs text-gray-400 mt-1.5">
-                    ※ この設定はすべてのコンテストで共通です（再起動後も保持）
-                  </p>
                 </div>
 
-                {/* ケース生成機能 */}
                 <div className="pt-4 border-t">
-                  <label className="block text-sm font-bold text-gray-700 mb-2">テストケース再生成 (tools/gen)</label>
-                  <div className="flex items-center gap-3">
-                    <div className="flex items-center gap-2 bg-gray-100 p-2 rounded-lg border border-gray-300">
-                      <span className="text-sm font-bold text-gray-600">Cases:</span>
-                      <input type="number" min="1" max="1000" value={testCases} onChange={e => setTestCases(Number(e.target.value))} className="w-16 bg-transparent outline-none font-bold text-gray-800" />
-                    </div>
-                    <button
-                      onClick={() => { handleGenerateInputs(); setIsSettingsOpen(false); }}
-                      className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg flex items-center gap-2 font-bold shadow-sm transition-colors"
-                    >
-                      <Plus size={16} /> 生成を実行
-                    </button>
-                  </div>
+                  <label className="block text-sm font-bold text-gray-700 mb-1">並列実行数</label>
+                  <p className="text-xs text-gray-500 mb-2">
+                    提出実行と定数チューニングの両方で使います。既定値は 論理プロセッサ数 ({logicalProcessorCount}) - 1 です。
+                  </p>
+                  <input
+                    type="number"
+                    min={1}
+                    value={parallelism}
+                    onChange={e => setParallelism(Math.max(1, Math.floor(Number(e.target.value) || 1)))}
+                    className="w-full border border-gray-300 rounded-lg p-2 text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  />
+                  {parallelism > logicalProcessorCount && (
+                    <p className="text-xs text-amber-600 font-bold mt-2">
+                      論理プロセッサ数 ({logicalProcessorCount}) を超えています。文脈切替やメモリ競合で遅くなることがあります。
+                    </p>
+                  )}
                 </div>
               </div>
 
               <div className="p-4 border-t bg-gray-50 flex justify-end gap-3">
-                <button onClick={() => setIsSettingsOpen(false)} className="px-5 py-2 font-bold text-gray-600 bg-gray-200 hover:bg-gray-300 rounded-lg transition-colors">キャンセル</button>
-                <button onClick={saveSettings} className="px-5 py-2 font-bold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-md transition-colors flex items-center gap-2">
-                  <Settings size={18} /> 設定を保存
-                </button>
+                <button onClick={() => setIsGlobalSettingsOpen(false)} className="px-5 py-2 font-bold text-gray-600 bg-gray-200 hover:bg-gray-300 rounded-lg transition-colors">閉じる</button>
               </div>
             </div>
           </div>
@@ -2734,7 +3465,7 @@ function App() {
 
         {/* 右側エリア（ビジュアライザ）— 独立スクロール不可・高さ固定 */}
         {visData && (
-          <div className="w-[50%] min-w-[440px] max-w-[60%] border-l border-gray-300 bg-white flex flex-col overflow-hidden shadow-[-8px_0_16px_-8px_rgba(0,0,0,0.08)] z-10">
+          <div className="w-[50%] min-w-[440px] max-w-[60%] min-h-0 border-l border-gray-300 bg-white flex flex-col overflow-hidden shadow-[-8px_0_16px_-8px_rgba(0,0,0,0.08)] z-10">
             <div className="p-3 bg-gray-50 border-b flex justify-between items-center flex-none">
               <div className="flex items-center gap-4">
                 <h3 className="font-bold flex items-center gap-2 text-gray-800"><Eye size={18} className="text-blue-500" /> Visualizer</h3>
