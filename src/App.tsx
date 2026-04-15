@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import Editor from '@monaco-editor/react';
-import { Code2, Play, LayoutList, Settings, Plus, Folder, ArrowLeft, Loader2, CheckCircle2, AlertCircle, Trophy, Edit2, Clock, Trash2, FileCode2, Eye, ExternalLink, BarChart2, Copy, Check, Star, Sliders, Zap, StopCircle, TrendingUp, RefreshCw } from 'lucide-react';
+import { Code2, Play, LayoutList, Settings, Plus, Folder, ArrowLeft, Loader2, CheckCircle2, AlertCircle, Trophy, Edit2, Clock, Trash2, FileCode2, Eye, ExternalLink, BarChart2, Copy, Check, Star, Sliders, Zap, StopCircle, TrendingUp, RefreshCw, Archive } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { readText } from '@tauri-apps/plugin-clipboard-manager';
@@ -9,7 +9,10 @@ type TestCaseResult = { id: number; score: number; status: string; time: number;
 
 type Submission = {
   id: string; timestamp: number; time: string; name: string; totalScore: number; codeLength: number;
-  status: string; memory: string; execTime: number; code: string; language: string; testCases: TestCaseResult[];
+  status: string; execTime: number; code: string; language: string; testCases: TestCaseResult[];
+  submissionNumber?: number;
+  compileError?: string | null;
+  executionTag?: string | null;
 };
 
 type VisData = { html: string; input: string; output: string; stderr: string; web_url: string | null; local_url: string | null };
@@ -19,6 +22,20 @@ type ContestConfig = {
   tools_dir: string;
   optimize_target: 'minimize' | 'maximize';
   variables: string;
+  score_display?: 'sum' | 'average';
+  archived?: boolean;
+};
+
+type PendingSubmission = {
+  id: string;
+  contestName: string;
+  code: string;
+  language: string;
+  caseIds: number[];
+  setupTestCases: number;
+  timeLimit: number;
+  memoryLimit: number;
+  executionTag?: string | null;
 };
 
 type TuningParam = {
@@ -756,7 +773,7 @@ const SvgSeedLinePlot = React.memo(({
 
 
 // ① ContestItem型を定義
-type ContestItem = { name: string; updated_at: number };
+type ContestItem = { name: string; updated_at: number; archived?: boolean };
 
 // 散布図はカスタムホバーツールチップを使うため、Recharts標準ツールチップは不要（現在未使用）
 // const CustomTooltip = () => null;
@@ -772,6 +789,31 @@ const formatTimestamp = (timestamp: number) => {
     hour: '2-digit',
     minute: '2-digit',
   });
+};
+
+const parseSubmissionNumberFromName = (name: string) => {
+  const match = name.match(/^提出\s+(\d+)$/);
+  return match ? Number(match[1]) : null;
+};
+
+const normalizeSubmissionNumbers = (list: Submission[]) => {
+  const sorted = [...list].sort((a, b) => a.timestamp - b.timestamp);
+  let nextNumber = 1;
+  const numberById = new Map<string, number>();
+
+  for (const sub of sorted) {
+    const existingNumber = sub.submissionNumber ?? parseSubmissionNumberFromName(sub.name);
+    const assignedNumber = existingNumber && existingNumber >= 1 ? existingNumber : nextNumber;
+    numberById.set(sub.id, assignedNumber);
+    nextNumber = Math.max(nextNumber, assignedNumber + 1);
+  }
+
+  return list.map(sub => ({ ...sub, submissionNumber: numberById.get(sub.id) ?? 1 }));
+};
+
+const deferredSectionStyle: React.CSSProperties = {
+  contentVisibility: 'auto',
+  containIntrinsicSize: '560px',
 };
 
 function App() {
@@ -833,6 +875,7 @@ function App() {
     const parsed = saved ? Number(saved) : NaN;
     return Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : 3;
   });
+  const editorStateKey = currentContest ? `heu_editor_${currentContest}` : null;
   useEffect(() => {
     localStorage.setItem('heu_dialog_default_path', dialogDefaultPath);
   }, [dialogDefaultPath]);
@@ -856,14 +899,20 @@ function App() {
   }, []);
 
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const cancelRef = useRef(false);
   const runningSubIdRef = useRef<string | null>(null);
+  const [submitQueue, setSubmitQueue] = useState<PendingSubmission[]>([]);
+  const submitQueueRef = useRef<PendingSubmission[]>([]);
+  const submitProcessorRunningRef = useRef(false);
+  const cancelledSubmissionIdsRef = useRef<Set<string>>(new Set());
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [status, setStatus] = useState<{ type: 'info' | 'success' | 'error', message: string } | null>(null);
 
   const [submissionsMap, setSubmissionsMap] = useState<Record<string, Submission[]>>({});
   const [selectedSubId, setSelectedSubId] = useState<string | null>(null);
   const [detailTab, setDetailTab] = useState<'results' | 'code'>('results');
+  const [detailReturnTab, setDetailReturnTab] = useState<'submissions' | 'stats'>('submissions');
 
   const [visData, setVisData] = useState<VisData | null>(null);
   const visDataRef = useRef<VisData | null>(null);
@@ -877,6 +926,10 @@ function App() {
   const [memos, setMemos] = useState<Record<string, string>>({});
   const [favorites, setFavorites] = useState<Set<number>>(new Set());
   const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
+  const [submissionFavorites, setSubmissionFavorites] = useState<Set<string>>(new Set());
+  const [showSubmissionFavoritesOnly, setShowSubmissionFavoritesOnly] = useState(false);
+  const [submitMode, setSubmitMode] = useState<'regular' | 'favorites' | 'filtered'>('regular');
+  const [submitVarFilters, setSubmitVarFilters] = useState<Record<string, { min: number | '', max: number | '' }>>({});
 
   const toggleFavorite = async (caseId: number) => {
     if (!currentContest) return;
@@ -916,12 +969,12 @@ function App() {
   const [statsScoreMode, setStatsScoreMode] = useState<'absolute' | 'relative'>('absolute');
   const [statsSubPage, setStatsSubPage] = useState(1);
   const [statsSubPageSize, setStatsSubPageSize] = useState(20);
+  const [statsSubmissionSort, setStatsSubmissionSort] = useState<{ key: string; order: 'asc' | 'desc' }>({ key: 'timestamp', order: 'desc' });
   // 統計グラフ上のポイントhoverツールチップ
   const [statsPointTooltip, setStatsPointTooltip] = useState<HoverInfo | null>(null);
   const [currentVisId, setCurrentVisId] = useState<number | null>(null);
   const [currentVisSubId, setCurrentVisSubId] = useState<string | null>(null);
-  // X軸モード: 'auto'=変数ごと | 'seed'=seed軸折れ線
-  const [statsXAxisMode, setStatsXAxisMode] = useState<'auto' | 'seed'>('auto');
+  const [visZoom, setVisZoom] = useState(90);
   const [seedRange, setSeedRange] = useState<{ min: number | ''; max: number | '' }>({ min: '', max: '' });
   // クリック時に最新のホバー点を確実に参照するための ref（state は非同期なので不確実）
   const hoveredPointRef = React.useRef<{ id: number } | null>(null);
@@ -937,12 +990,36 @@ function App() {
     });
   }, [contests, sortType]);
 
+  const updateQueueState = (updater: (prev: PendingSubmission[]) => PendingSubmission[]) => {
+    const next = updater(submitQueueRef.current);
+    submitQueueRef.current = next;
+    setSubmitQueue(next);
+  };
+
+  const updateContestSubmissions = (contestName: string, updater: (list: Submission[]) => Submission[], persist = false) => {
+    setSubmissionsMap(prev => {
+      const list = prev[contestName] || [];
+      const newList = normalizeSubmissionNumbers(updater(list));
+      if (persist) saveSubmissions(contestName, newList);
+      return { ...prev, [contestName]: newList };
+    });
+  };
+
+  const isAcceptedResult = (tc: TestCaseResult) => tc.status === 'AC';
+
   // ★ 追加: コンテストが切り替わったら統計の選択状態をリセットする
   useEffect(() => {
     setSelectedForStats(new Set());
     setVarFilters({});
     setStatsScoreMode('absolute');
     setStatsSubPage(1);
+    setSeedRange({ min: '', max: '' });
+    setShowSubmissionFavoritesOnly(false);
+  }, [currentContest]);
+
+  useEffect(() => {
+    setSubmitMode('regular');
+    setSubmitVarFilters({});
   }, [currentContest]);
 
   // 提出の選択が変わったら展開中のIOをリセット
@@ -953,6 +1030,12 @@ function App() {
 
   // submissions を先に計算
   const submissions = currentContest ? (submissionsMap[currentContest] || []) : [];
+  const currentQueuedCount = currentContest ? submitQueue.filter(item => item.contestName === currentContest).length : 0;
+  const currentRunningSubmissionId = currentContest
+    ? (runningSubIdRef.current && submissions.some(sub => sub.id === runningSubIdRef.current) ? runningSubIdRef.current : null)
+    : null;
+  const currentCancellableSubmissionId = currentRunningSubmissionId
+    ?? (currentContest ? [...submitQueue].reverse().find(item => item.contestName === currentContest)?.id ?? null : null);
 
   // 1. 各テストケースの「ベストスコア」を全提出から算出する
   const bestScores = useMemo(() => {
@@ -963,7 +1046,7 @@ function App() {
 
     submissions.forEach(sub => {
       sub.testCases?.forEach(tc => {
-        // エラー(スコア0やマイナス)を除外したい場合は条件を足せますが、一旦すべての有効なスコアを対象にします
+        if (!isAcceptedResult(tc)) return;
         if (best[tc.id] === undefined) {
           best[tc.id] = tc.score;
         } else {
@@ -975,40 +1058,105 @@ function App() {
   }, [submissions, config?.optimize_target]);
 
   // 2. 相対スコアを計算する関数
-  const calcRelativeScore = (score: number, bestScore: number | undefined) => {
-    if (bestScore === undefined) return 0;
+  const calcRelativeScore = (tc: TestCaseResult, bestScore: number | undefined) => {
+    if (!isAcceptedResult(tc) || bestScore === undefined) return 0;
     const isMin = config?.optimize_target === 'minimize';
     // ご要望の計算式: 10^5 * ...
     const rel = isMin
-      ? 1e5 * (1 + bestScore) / (1 + score)
-      : 1e5 * (1 + score) / (1 + bestScore);
+      ? 1e5 * (1 + bestScore) / (1 + tc.score)
+      : 1e5 * (1 + tc.score) / (1 + bestScore);
     return Math.round(rel);
   };
 
   const getScoreByMode = (tc: TestCaseResult, mode: 'absolute' | 'relative') => {
-    if (mode === 'relative') return calcRelativeScore(tc.score, bestScores[tc.id]);
+    if (mode === 'relative') return calcRelativeScore(tc, bestScores[tc.id]);
     return tc.score;
+  };
+
+  const passesAbsoluteScoreFilter = (tc: TestCaseResult, filters: Record<string, { min: number | '', max: number | '' }>) => {
+    const scoreFilterMin = filters[SCORE_FILTER_KEY]?.min;
+    const scoreFilterMax = filters[SCORE_FILTER_KEY]?.max;
+    if (typeof scoreFilterMin === 'number' && tc.score < scoreFilterMin) return false;
+    if (typeof scoreFilterMax === 'number' && tc.score > scoreFilterMax) return false;
+    return true;
+  };
+
+  const passesVariableFilters = (
+    tc: TestCaseResult,
+    variableNames: string[],
+    testcaseVarsMap: Record<number, Record<string, number>>,
+    filters: Record<string, { min: number | '', max: number | '' }>,
+  ) => {
+    for (const name of variableNames) {
+      const value = testcaseVarsMap[tc.id]?.[name];
+      if (value === undefined) continue;
+      const fMin = filters[name]?.min;
+      const fMax = filters[name]?.max;
+      if (typeof fMin === 'number' && value < fMin) return false;
+      if (typeof fMax === 'number' && value > fMax) return false;
+    }
+    return true;
+  };
+
+  const getActiveContestVariables = () => {
+    const vars = Object.keys(testcaseVars[0] || {});
+    return vars.filter(v => {
+      const firstVal = testcaseVars[0]?.[v];
+      return Object.values(testcaseVars).some(tc => tc[v] !== firstVal);
+    });
+  };
+  const submitActiveVars = getActiveContestVariables();
+  const isCustomSubmitMode = submitMode !== 'regular';
+  const hasSubmitVarCondition = Object.values(submitVarFilters).some(range => typeof range?.min === 'number' || typeof range?.max === 'number');
+  const maxRelativeScore = 100000;
+
+  const toggleSubmissionFavorite = (submissionId: string) => {
+    if (!currentContest) return;
+    setSubmissionFavorites(prev => {
+      const next = new Set(prev);
+      if (next.has(submissionId)) next.delete(submissionId);
+      else next.add(submissionId);
+      localStorage.setItem(`heu_submission_favorites_${currentContest}`, JSON.stringify(Array.from(next)));
+      return next;
+    });
+  };
+
+  const openSubmissionDetail = (submissionId: string, returnTab: 'submissions' | 'stats') => {
+    setDetailReturnTab(returnTab);
+    setSelectedSubId(submissionId);
+    setDetailTab('results');
+    setActiveTab('submissions');
+  };
+
+  const closeSubmissionDetail = () => {
+    setSelectedSubId(null);
+    setDetailTab('results');
+    if (detailReturnTab === 'stats') {
+      setActiveTab('stats');
+    }
   };
 
   // 3. 提出一覧（ソート＆相対スコア合計付き）
   const sortedSubmissions = useMemo(() => {
     if (!submissions) return [];
+    const useAverageScore = config?.score_display === 'average';
 
     const mapped = submissions.map(sub => {
       const cases = sub.testCases ?? [];
-      const totalRelScore = cases.reduce((acc, tc) => acc + calcRelativeScore(tc.score, bestScores[tc.id]), 0);
-      // ソート用: テストケース数で割った平均（件数が違っても公平に比較できる）
+      const totalRelScore = cases.reduce((acc, tc) => acc + calcRelativeScore(tc, bestScores[tc.id]), 0);
+      const uniqueCaseCount = cases.reduce((acc, tc) => acc + (calcRelativeScore(tc, bestScores[tc.id]) === maxRelativeScore ? 1 : 0), 0);
       const n = cases.length || 1;
       const avgScore = sub.totalScore / n;
       const avgRelScore = totalRelScore / n;
-      return { ...sub, totalRelScore, _avgScore: avgScore, _avgRelScore: avgRelScore };
+      const displayScore = useAverageScore ? avgScore : sub.totalScore;
+      return { ...sub, totalRelScore, uniqueCaseCount, _avgScore: avgScore, _avgRelScore: avgRelScore, _displayScore: displayScore };
     });
 
     return mapped.sort((a, b) => {
       let valA: number, valB: number;
       if (submissionSort.key === 'totalScore') {
-        valA = a._avgScore; valB = b._avgScore;
-      } else if (submissionSort.key === 'totalRelScore') {
+        valA = a._displayScore; valB = b._displayScore;
+      } else if (submissionSort.key === 'avgRelScore') {
         valA = a._avgRelScore; valB = b._avgRelScore;
       } else {
         valA = a[submissionSort.key as keyof typeof a] as any;
@@ -1018,8 +1166,26 @@ function App() {
       if (valA > valB) return submissionSort.order === 'asc' ? 1 : -1;
       return 0;
     });
-  }, [submissions, submissionSort, bestScores, config?.optimize_target]);
+  }, [submissions, submissionSort, bestScores, config?.optimize_target, config?.score_display]);
   // ★ ここまで追加
+
+  const statsSortedSubmissions = useMemo(() => {
+    const copied = [...sortedSubmissions];
+    return copied.sort((a: any, b: any) => {
+      let valA: number | string = a[statsSubmissionSort.key as keyof typeof a] as any;
+      let valB: number | string = b[statsSubmissionSort.key as keyof typeof b] as any;
+      if (statsSubmissionSort.key === 'totalScore') {
+        valA = a._displayScore;
+        valB = b._displayScore;
+      } else if (statsSubmissionSort.key === 'avgRelScore') {
+        valA = a._avgRelScore;
+        valB = b._avgRelScore;
+      }
+      if (valA < valB) return statsSubmissionSort.order === 'asc' ? -1 : 1;
+      if (valA > valB) return statsSubmissionSort.order === 'asc' ? 1 : -1;
+      return 0;
+    });
+  }, [sortedSubmissions, statsSubmissionSort]);
 
   const getBestSubmissionsForCase = (caseId: number) => {
     const bestScore = bestScores[caseId];
@@ -1027,7 +1193,7 @@ function App() {
     const winners = submissions
       .map(sub => {
         const tc = sub.testCases?.find(t => t.id === caseId);
-        return tc && tc.score === bestScore ? { id: sub.id, name: sub.name, score: tc.score } : null;
+        return tc && isAcceptedResult(tc) && tc.score === bestScore ? { id: sub.id, name: sub.name, score: tc.score } : null;
       })
       .filter((entry): entry is { id: string; name: string; score: number } => entry !== null);
     return { bestScore, winners };
@@ -1118,7 +1284,56 @@ function App() {
     setTcPage(1);
   };
 
+  const handleStatsSubmissionSort = (key: string) => {
+    setStatsSubmissionSort(prev => ({
+      key, order: prev.key === key && prev.order === 'desc' ? 'asc' : 'desc'
+    }));
+    setStatsSubPage(1);
+  };
+
   useEffect(() => { loadContests(); }, []);
+
+  const scoreDisplayMode = config?.score_display === 'average' ? 'average' : 'sum';
+  const scoreColumnLabel = scoreDisplayMode === 'average' ? '平均得点' : '得点';
+  const visScale = visZoom / 100;
+  const visOuterScale = Math.max(visScale, 1);
+  const visInnerBase = visScale < 1 ? 100 / visScale : 100;
+  const formatSubmissionScore = (sub: { totalScore: number; testCases?: TestCaseResult[]; _displayScore?: number }) => {
+    const value = sub._displayScore ?? (scoreDisplayMode === 'average'
+      ? sub.totalScore / Math.max(1, sub.testCases?.length || 0)
+      : sub.totalScore);
+    return value.toLocaleString(undefined, scoreDisplayMode === 'average'
+      ? { minimumFractionDigits: 2, maximumFractionDigits: 2 }
+      : { maximumFractionDigits: 0 });
+  };
+
+  useEffect(() => {
+    if (!currentContest) {
+      setLanguage('cpp');
+      setCode(DEFAULT_CODE['cpp']);
+      return;
+    }
+    try {
+      const saved = editorStateKey ? localStorage.getItem(editorStateKey) : null;
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        const nextLanguage = parsed.language && DEFAULT_CODE[parsed.language] ? parsed.language : 'cpp';
+        setLanguage(nextLanguage);
+        setCode(typeof parsed.code === 'string' ? parsed.code : DEFAULT_CODE[nextLanguage]);
+      } else {
+        setLanguage('cpp');
+        setCode(DEFAULT_CODE['cpp']);
+      }
+    } catch {
+      setLanguage('cpp');
+      setCode(DEFAULT_CODE['cpp']);
+    }
+  }, [currentContest]);
+
+  useEffect(() => {
+    if (!editorStateKey) return;
+    localStorage.setItem(editorStateKey, JSON.stringify({ language, code }));
+  }, [editorStateKey, language, code]);
 
   // ── コンテストごとの制限値・チューニング設定をlocalStorageから復元 ──
   const limitsLoadedRef = useRef(false);
@@ -1189,8 +1404,15 @@ function App() {
       invoke<number[]>('get_testcase_favorites', { contestName: currentContest })
         .then(data => setFavorites(new Set(data)))
         .catch(console.error);
+      try {
+        const raw = localStorage.getItem(`heu_submission_favorites_${currentContest}`);
+        setSubmissionFavorites(new Set(raw ? JSON.parse(raw) : []));
+      } catch {
+        setSubmissionFavorites(new Set());
+      }
     } else {
       setConfig(null);
+      setSubmissionFavorites(new Set());
     }
   }, [currentContest]);
 
@@ -1223,6 +1445,7 @@ function App() {
     try {
       // ★ 追加: コンテスト名が変更された場合の処理
       const newName = editingConfig.name.trim();
+      const nextConfig = { ...editingConfig, name: newName || currentContest, score_display: editingConfig.score_display ?? 'sum' };
       if (newName && newName !== currentContest) {
         await invoke('rename_contest', { oldName: currentContest, newName: newName });
 
@@ -1234,9 +1457,9 @@ function App() {
       }
 
       // 既存の設定保存処理（リネームされている可能性があるので newName を使う）
-      await invoke('save_contest_config', { contestName: newName || currentContest, config: editingConfig });
+      await invoke('save_contest_config', { contestName: newName || currentContest, config: nextConfig });
 
-      setConfig(editingConfig);
+      setConfig(nextConfig);
       setIsSettingsOpen(false);
       showStatus('success', '設定を保存しました');
     } catch (e) {
@@ -1259,7 +1482,6 @@ function App() {
       if (selectedPath && typeof selectedPath === 'string') {
         setIsProcessing(true);
         showStatus('info', 'ZIPを展開しています...');
-
         await invoke('update_tools_from_zip', { contestName: currentContest, zipPath: selectedPath });
 
         showStatus('success', 'toolsを更新しました！');
@@ -1276,7 +1498,7 @@ function App() {
     if (currentContest) {
       invoke<string>('load_submissions', { contestName: currentContest })
         .then(res => {
-          const parsed = JSON.parse(res);
+          const parsed = normalizeSubmissionNumbers(JSON.parse(res));
           setSubmissionsMap(prev => ({ ...prev, [currentContest]: parsed }));
         }).catch(console.error);
     }
@@ -1285,6 +1507,12 @@ function App() {
   const saveSubmissions = async (contest: string, data: Submission[]) => {
     try { await invoke('save_submissions', { contestName: contest, data: JSON.stringify(data) }); }
     catch (e) { console.error(e); }
+  };
+
+  const refreshTestcaseVariables = async (contestName: string) => {
+    const data = await invoke<Record<number, Record<string, number>>>('get_testcase_variables', { contestName });
+    setTestcaseVars(data);
+    return data;
   };
 
   const showStatus = (type: 'info' | 'success' | 'error', message: string) => {
@@ -1300,21 +1528,21 @@ function App() {
     if (!newContestName.trim()) { showStatus('error', 'コンテスト名を入力してください'); return; }
     try {
       const selected = await open({ multiple: false, filters: [{ name: 'ZIP', extensions: ['zip'] }], defaultPath: dialogDefaultPath || undefined });
-      if (selected && typeof selected === 'string') {
-        setIsProcessing(true);
-        showStatus('info', `${newContestName} の環境を構築中...`);
-        const result = await invoke<string>('create_contest', {
-          name: newContestName.trim(),
-          zipPath: selected,
-          optimizeTarget: newOptimizeTarget,
-          variables: newVariables
-        });
-        showStatus('success', result);
-        setNewContestName('');
-        setNewOptimizeTarget('maximize');
-        setNewVariables('');
-        loadContests();
-      }
+      if (!selected || typeof selected !== 'string') return;
+
+      setIsProcessing(true);
+      showStatus('info', `${newContestName} の環境を構築中...`);
+      const result = await invoke<string>('create_contest', {
+        name: newContestName.trim(),
+        zipPath: selected,
+        optimizeTarget: newOptimizeTarget,
+        variables: newVariables
+      });
+      showStatus('success', result);
+      setNewContestName('');
+      setNewOptimizeTarget('maximize');
+      setNewVariables('');
+      loadContests();
     } catch (error) { showStatus('error', String(error)); }
     finally { setIsProcessing(false); }
   };
@@ -1345,15 +1573,61 @@ function App() {
     );
   };
 
+  const archiveContest = (contestName: string, archived?: boolean) => {
+    if (archived) return;
+    const hasRunning = runningSubIdRef.current !== null && submissionsMap[contestName]?.some(sub => sub.id === runningSubIdRef.current);
+    const hasQueued = submitQueueRef.current.some(item => item.contestName === contestName);
+    if (hasRunning || hasQueued) {
+      showStatus('error', '実行中または待機中の提出があるため、今はアーカイブできません');
+      return;
+    }
+
+    showConfirm(
+      `「${contestName}」をアーカイブしますか？`,
+      'seedごとのIOや提出コードなどの重いデータを削除し、提出一覧と統計のみ閲覧可能にします。',
+      async () => {
+        setConfirmDialog(null);
+        try {
+          await invoke('archive_contest', { contestName });
+          const nextConfig = currentContest === contestName && config ? { ...config, archived: true } : config;
+          if (currentContest === contestName) {
+            setConfig(nextConfig ?? null);
+            setEditingConfig(nextConfig ?? null);
+          }
+          setContests(prev => prev.map(contest => contest.name === contestName ? { ...contest, archived: true, updated_at: Math.floor(Date.now() / 1000) } : contest));
+          setSubmissionsMap(prev => {
+            const list = prev[contestName] || [];
+            return {
+              ...prev,
+              [contestName]: list.map(sub => ({
+                ...sub,
+                code: '',
+                compileError: null,
+                testCases: (sub.testCases || []).map(tc => ({ ...tc, error_msg: '' })),
+              })),
+            };
+          });
+          showStatus('success', 'アーカイブしました');
+        } catch (error) {
+          showStatus('error', String(error));
+        }
+      },
+      'アーカイブ'
+    );
+  };
+
   const handleDeleteSubmission = (e: React.MouseEvent, subId: string) => {
     e.stopPropagation();
     const isRunning = runningSubIdRef.current === subId;
+    const isQueued = submitQueueRef.current.some(item => item.id === subId);
     showConfirm(
       'この提出を削除しますか？',
-      isRunning ? '現在実行中です。キャンセルしてから削除します。' : undefined,
+      isRunning ? '現在実行中です。キャンセルしてから削除します。' : isQueued ? '待機中の提出です。待機列からも削除します。' : undefined,
       () => {
         setConfirmDialog(null);
+        cancelledSubmissionIdsRef.current.add(subId);
         if (isRunning) cancelRef.current = true;
+        if (isQueued) updateQueueState(prev => prev.filter(item => item.id !== subId));
         // バックグラウンドでディレクトリ削除（失敗しても無視）
         invoke('delete_submission_dir', { contestName: currentContest!, submissionId: subId }).catch(console.error);
         setSubmissionsMap(prev => {
@@ -1373,6 +1647,7 @@ function App() {
     showStatus('info', `テストケースを ${testCases} 個生成中...`);
     try {
       const result = await invoke<string>('generate_inputs', { contestName: currentContest, testCases });
+      await refreshTestcaseVariables(currentContest);
       showStatus('success', result);
     } catch (error) { showStatus('error', String(error)); }
     finally { setIsProcessing(false); }
@@ -1603,11 +1878,90 @@ function App() {
     showStatus('success', `履歴「${session.name}」を読み込みました`);
   };
 
-  const handleSubmit = async () => {
-    if (!currentContest) return;
+  const collectFilteredCaseIds = async () => {
+    if (!currentContest) return { caseIds: [] as number[], setupTestCases: testCases, executionTag: null as string | null };
 
-    // チューニング中なら一時停止して待機
-    if (isTuningRef.current) {
+    if (submitMode === 'favorites') {
+      const caseIds = Array.from(favorites).sort((a, b) => a - b).slice(0, Math.min(testCases, favorites.size));
+      return {
+        caseIds,
+        setupTestCases: Math.max(testCases, caseIds.length > 0 ? Math.max(...caseIds) + 1 : testCases),
+        executionTag: caseIds.length > 0 ? `お気に入り実行 (${caseIds.length}件)` : 'お気に入り実行 (0件)',
+      };
+    }
+
+    if (submitMode !== 'filtered') {
+      return {
+        caseIds: Array.from({ length: testCases }, (_, i) => i),
+        setupTestCases: testCases,
+        executionTag: null,
+      };
+    }
+
+    const variableNames = getActiveContestVariables();
+    if (variableNames.length === 0 && Object.keys(submitVarFilters).length === 0) {
+      return {
+        caseIds: Array.from({ length: testCases }, (_, i) => i),
+        setupTestCases: testCases,
+        executionTag: null,
+      };
+    }
+
+    const startAt = Date.now();
+    let poolSize = Math.max(testCases, Object.keys(testcaseVars).length || testCases);
+    let currentVars = await refreshTestcaseVariables(currentContest);
+    const pick = (varsMap: Record<number, Record<string, number>>) => Array
+      .from({ length: poolSize }, (_, i) => i)
+      .filter((id) => {
+        const tc: TestCaseResult = { id, score: 0, status: 'WA', time: 0, error_msg: '' };
+        return passesVariableFilters(tc, variableNames, varsMap, submitVarFilters);
+      })
+      .slice(0, testCases);
+
+    let caseIds = pick(currentVars);
+    while (caseIds.length < testCases && Date.now() - startAt < 30000) {
+      poolSize += Math.max(50, testCases);
+      showStatus('info', `条件に合うケースを探索中... (${poolSize} 件まで生成)`);
+      await invoke<string>('generate_inputs', { contestName: currentContest, testCases: poolSize });
+      currentVars = await refreshTestcaseVariables(currentContest);
+      caseIds = pick(currentVars);
+    }
+
+    return {
+      caseIds,
+      setupTestCases: poolSize,
+      executionTag: `条件絞り込み実行 (${caseIds.length}件)`,
+    };
+  };
+
+  const cancelSubmission = (subId: string) => {
+    cancelledSubmissionIdsRef.current.add(subId);
+    if (runningSubIdRef.current === subId) {
+      cancelRef.current = true;
+      showStatus('info', '実行中の提出をキャンセルしています...');
+      return;
+    }
+    updateQueueState(prev => prev.filter(item => item.id !== subId));
+    if (currentContest) {
+      updateContestSubmissions(currentContest, list => list.map(sub => sub.id === subId ? { ...sub, status: 'Cancelled' } : sub), true);
+    } else {
+      setSubmissionsMap(prev => {
+        const next = { ...prev };
+        Object.keys(next).forEach(contestName => {
+          const list = next[contestName] || [];
+          const updated = list.map(sub => sub.id === subId ? { ...sub, status: 'Cancelled' } : sub);
+          if (updated !== list) {
+            next[contestName] = updated;
+            saveSubmissions(contestName, updated);
+          }
+        });
+        return next;
+      });
+    }
+  };
+
+  const runSubmission = async (item: PendingSubmission) => {
+    if (currentContest === item.contestName && isTuningRef.current) {
       shouldPauseTuningRef.current = true;
       const waitStart = Date.now();
       while (!tuningPausedRef.current && isTuningRef.current && Date.now() - waitStart < 8000) {
@@ -1615,104 +1969,170 @@ function App() {
       }
     }
 
-    setIsProcessing(true);
+    runningSubIdRef.current = item.id;
     cancelRef.current = false;
-    setSubmitError(null);
-    showStatus('info', 'コンパイル・準備中...');
+    updateContestSubmissions(item.contestName, list => list.map(s => s.id === item.id ? { ...s, status: 'Compiling...', compileError: null } : s));
 
     try {
-      await invoke('setup_submission', { contestName: currentContest, code: code, language: language, testCases: testCases });
+      await invoke('setup_submission', {
+        contestName: item.contestName,
+        code: item.code,
+        language: item.language,
+        testCases: item.setupTestCases,
+      });
+    } catch (error) {
+      const compileError = String(error);
+      updateContestSubmissions(item.contestName, list => list.map(s => s.id === item.id ? { ...s, status: 'CE', compileError } : s), true);
+      if (currentContest === item.contestName) {
+        setSubmitError(compileError);
+        setActiveTab('submit');
+      }
+      showStatus('error', `提出 ${item.id} のコンパイルに失敗しました`);
+      return;
+    }
 
+    updateContestSubmissions(item.contestName, list => list.map(s => s.id === item.id ? { ...s, status: `Running... (0/${item.caseIds.length})` } : s));
+
+    let runningScore = 0;
+    let maxTime = 0;
+    let completedCases = 0;
+    const resultsArr: TestCaseResult[] = [];
+
+    const updateRunningState = () => {
+      updateContestSubmissions(item.contestName, list => list.map(s => (
+        s.id === item.id
+          ? { ...s, totalScore: runningScore, execTime: maxTime, status: `Running... (${completedCases}/${item.caseIds.length})`, testCases: [...resultsArr].sort((a, b) => a.id - b.id) }
+          : s
+      )));
+    };
+
+    const runQueue = async (queue: number[]) => {
+      while (queue.length > 0) {
+        if (cancelRef.current || cancelledSubmissionIdsRef.current.has(item.id)) break;
+        const i = queue.shift();
+        if (i === undefined) break;
+
+        let res: TestCaseResult;
+        try {
+          res = await invoke<TestCaseResult>('run_test_case', {
+            contestName: item.contestName,
+            language: item.language,
+            caseId: i,
+            timeLimit: item.timeLimit,
+            memoryLimit: item.memoryLimit,
+            submissionId: item.id,
+          });
+        } catch (e) {
+          res = { id: i, score: 0, status: 'IE', time: 0, error_msg: String(e) };
+        }
+
+        runningScore += res.score;
+        maxTime = Math.max(maxTime, res.time);
+        resultsArr.push(res);
+        completedCases++;
+        updateRunningState();
+      }
+    };
+
+    const concurrency = Math.max(1, Math.floor(parallelism));
+    const queue = [...item.caseIds];
+    await Promise.all(Array.from({ length: concurrency }, () => runQueue(queue)));
+
+    const cancelled = cancelRef.current || cancelledSubmissionIdsRef.current.has(item.id);
+    const hasIE = resultsArr.some(r => r.status === 'IE');
+    const hasMLE = resultsArr.some(r => r.status === 'MLE');
+    const hasTLE = resultsArr.some(r => r.status === 'TLE');
+    const hasRE = resultsArr.some(r => r.status === 'RE');
+    const hasWA = resultsArr.some(r => r.status === 'WA');
+    const finalStatus = cancelled ? `Cancelled (${completedCases}/${item.caseIds.length})` : hasIE ? 'IE' : hasMLE ? 'MLE' : hasTLE ? 'TLE' : hasRE ? 'RE' : hasWA ? 'WA' : 'AC';
+
+    updateContestSubmissions(item.contestName, list => list.map(s => (
+      s.id === item.id
+        ? { ...s, status: finalStatus, totalScore: runningScore, execTime: maxTime, testCases: [...resultsArr].sort((a, b) => a.id - b.id) }
+        : s
+    )), true);
+
+    if (cancelled) showStatus('info', `提出をキャンセルしました（${completedCases}件完了）`);
+    else showStatus('success', `提出 ${item.id} の実行が完了しました`);
+  };
+
+  const processSubmissionQueue = async () => {
+    if (submitProcessorRunningRef.current) return;
+    submitProcessorRunningRef.current = true;
+
+    try {
+      while (submitQueueRef.current.length > 0) {
+        const [next, ...rest] = submitQueueRef.current;
+        submitQueueRef.current = rest;
+        setSubmitQueue(rest);
+        if (!next) break;
+        if (cancelledSubmissionIdsRef.current.has(next.id)) continue;
+        await runSubmission(next);
+      }
+    } finally {
+      submitProcessorRunningRef.current = false;
+      runningSubIdRef.current = null;
+      cancelRef.current = false;
+      shouldPauseTuningRef.current = false;
+    }
+  };
+
+  const handleSubmit = async () => {
+    if (!currentContest || config?.archived) return;
+    if (submitMode === 'filtered' && submitActiveVars.length === 0) {
+      showStatus('error', '変数絞り込みに使える変数がありません');
+      return;
+    }
+    if (submitMode === 'filtered' && !hasSubmitVarCondition) {
+      showStatus('error', '変数絞り込みの条件を1つ以上指定してください');
+      return;
+    }
+
+    setIsSubmitting(true);
+    setSubmitError(null);
+
+    try {
+      const prepared = await collectFilteredCaseIds();
+      if (prepared.caseIds.length === 0) {
+        showStatus('error', submitMode === 'favorites' ? 'お気に入りケースがありません' : '条件に合うケースが見つかりませんでした');
+        return;
+      }
       const subId = Date.now().toString();
-      runningSubIdRef.current = subId;
+      const nextSubmissionNumber = submissions.reduce((max, sub) => Math.max(max, sub.submissionNumber ?? parseSubmissionNumberFromName(sub.name) ?? 0), 0) + 1;
       const newSub: Submission = {
         id: subId, timestamp: Date.now(),
         time: new Date().toLocaleString('ja-JP', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-        name: `提出 ${submissions.length + 1}`, totalScore: 0, codeLength: new Blob([code]).size,
-        status: `Running... (0/${testCases})`, memory: '-', execTime: 0, code: code, language: language, testCases: []
+        name: `提出 ${nextSubmissionNumber}`, totalScore: 0, codeLength: new Blob([code]).size,
+        status: 'WJ', execTime: 0, code: code, language: language, testCases: [], compileError: null, executionTag: prepared.executionTag,
+        submissionNumber: nextSubmissionNumber,
       };
 
-      setSubmissionsMap(prev => {
-        const list = prev[currentContest] || [];
-        return { ...prev, [currentContest]: [newSub, ...list] };
+      updateContestSubmissions(currentContest, list => {
+        const newList = [newSub, ...list];
+        saveSubmissions(currentContest, newList);
+        return newList;
       });
-
+      updateQueueState(prev => [...prev, {
+        id: subId,
+        contestName: currentContest,
+        code,
+        language,
+        caseIds: prepared.caseIds,
+        setupTestCases: prepared.setupTestCases,
+        timeLimit,
+        memoryLimit,
+        executionTag: prepared.executionTag,
+      }]);
       setSelectedSubId(null);
       setActiveTab('submissions');
-      showStatus('info', 'テストケース並列実行中...');
-
-      let runningScore = 0; let maxTime = 0; let completedCases = 0;
-      const resultsArr: TestCaseResult[] = [];
-
-      const updateState = () => {
-        setSubmissionsMap(prev => {
-          const list = prev[currentContest] || [];
-          return {
-            ...prev,
-            [currentContest]: list.map(s => {
-              if (s.id === subId) {
-                return { ...s, totalScore: runningScore, execTime: maxTime, status: `Running... (${completedCases}/${testCases})`, testCases: [...resultsArr].sort((a, b) => a.id - b.id) };
-              }
-              return s;
-            })
-          };
-        });
-      };
-
-      const runQueue = async (queue: number[]) => {
-        while (queue.length > 0) {
-          if (cancelRef.current) break;
-          const i = queue.shift();
-          if (i === undefined) break;
-
-          let res: TestCaseResult;
-          try {
-            res = await invoke<TestCaseResult>('run_test_case', { contestName: currentContest, language: language, caseId: i, timeLimit: timeLimit, memoryLimit: memoryLimit, submissionId: subId });
-          } catch (e) { res = { id: i, score: 0, status: 'IE', time: 0, error_msg: String(e) }; }
-
-          runningScore += res.score;
-          maxTime = Math.max(maxTime, res.time);
-          resultsArr.push(res);
-          completedCases++;
-          updateState();
-        }
-      };
-
-      const concurrency = Math.max(1, Math.floor(parallelism));
-      const queue = Array.from({ length: testCases }, (_, i) => i);
-      const workers = [];
-      for (let i = 0; i < concurrency; i++) { workers.push(runQueue(queue)); }
-      await Promise.all(workers);
-
-      const cancelled = cancelRef.current;
-      const hasIE = resultsArr.some(r => r.status === 'IE');
-      const hasMLE = resultsArr.some(r => r.status === 'MLE');
-      const hasTLE = resultsArr.some(r => r.status === 'TLE');
-      const hasRE = resultsArr.some(r => r.status === 'RE');
-      const hasWA = resultsArr.some(r => r.status === 'WA');
-      const finalStatus = cancelled ? `Cancelled (${completedCases}/${testCases})` : hasIE ? 'IE' : hasMLE ? 'MLE' : hasTLE ? 'TLE' : hasRE ? 'RE' : hasWA ? 'WA' : 'AC';
-
-      setSubmissionsMap(prev => {
-        const list = prev[currentContest] || [];
-        const newList = list.map(s => s.id === subId ? { ...s, status: finalStatus, testCases: [...resultsArr].sort((a, b) => a.id - b.id) } : s);
-        saveSubmissions(currentContest, newList);
-        return { ...prev, [currentContest]: newList };
-      });
-      if (cancelled) { setStatus(null); showStatus('info', `キャンセルしました（${completedCases}件完了）`); }
-      else { showStatus('success', 'すべてのテストケースの実行が完了しました！'); }
-
-    } catch (error) {
-      setStatus(null);
-      setSubmitError(String(error));
-      setActiveTab('submit');
-      showStatus('error', 'コンパイルエラーが発生しました');
-    }
-    finally {
-      setIsProcessing(false);
-      cancelRef.current = false;
-      runningSubIdRef.current = null;
-      // チューニングを再開
-      shouldPauseTuningRef.current = false;
+      if (runningSubIdRef.current || submitProcessorRunningRef.current || submitQueueRef.current.length > 1) {
+        showStatus('info', '提出を待機列に追加しました');
+      } else {
+        showStatus('info', '提出を受け付けました');
+      }
+      void processSubmissionQueue();
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -1726,6 +2146,10 @@ function App() {
   };
 
   const openVisualizer = async (caseId: number, submissionId?: string) => {
+    if (config?.archived) {
+      showStatus('error', 'アーカイブ済みのためビジュアライザは利用できません');
+      return;
+    }
     setCurrentVisId(caseId);
     try {
       const data = await invoke<VisData>('get_visualizer_data', { contestName: currentContest, caseId, submissionId: submissionId ?? null });
@@ -1749,6 +2173,10 @@ function App() {
   };
 
   const toggleCaseIO = async (caseId: number, submissionId?: string) => {
+    if (config?.archived) {
+      showStatus('error', 'アーカイブ済みのため入出力は閲覧できません');
+      return;
+    }
     if (expandedCaseIO[caseId] !== undefined) {
       setExpandedCaseIO(prev => { const next = { ...prev }; delete next[caseId]; return next; });
       return;
@@ -1793,6 +2221,10 @@ function App() {
     else if (st === 'WA') color = 'bg-yellow-100 text-yellow-700 border-yellow-300';
     else if (st === 'TLE') color = 'bg-orange-100 text-orange-700 border-orange-300';
     else if (st === 'MLE') color = 'bg-purple-100 text-purple-700 border-purple-300';
+    else if (st === 'CE') color = 'bg-red-100 text-red-700 border-red-300';
+    else if (st === 'WJ') color = 'bg-slate-100 text-slate-700 border-slate-300';
+    else if (st.startsWith('Cancelled')) color = 'bg-gray-100 text-gray-700 border-gray-300';
+    else if (st === 'Compiling...') color = 'bg-cyan-100 text-cyan-700 border-cyan-300';
     if (st.startsWith('Running')) return <span className="px-2 py-1 rounded text-xs font-bold border bg-blue-100 text-blue-700 border-blue-300 animate-pulse">{st}</span>;
     return <span className={`px-2 py-1 rounded text-xs font-bold border ${color}`}>{st}</span>;
   };
@@ -1881,6 +2313,7 @@ function App() {
                     >
                       <span className="font-bold text-gray-800 group-hover:text-blue-700 transition-colors flex items-center gap-2">
                         {contest.name}
+                        {contest.archived && <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 border border-amber-200">Archived</span>}
                         <Play size={16} className="text-gray-400 group-hover:text-blue-600" />
                       </span>
 
@@ -1889,6 +2322,17 @@ function App() {
                         <Clock size={14} />
                         {formatTimestamp(contest.updated_at)}
                       </span>
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        archiveContest(contest.name, contest.archived);
+                      }}
+                      disabled={contest.archived}
+                      className="p-3 text-amber-600 hover:bg-amber-50 border border-transparent hover:border-amber-200 rounded transition-colors disabled:opacity-40"
+                      title={contest.archived ? 'アーカイブ済み' : 'アーカイブ'}
+                    >
+                      <Archive size={18} />
                     </button>
                     <button onClick={(e) => handleDeleteContest(e, contest.name)} className="p-3 text-red-500 hover:bg-red-50 border border-transparent hover:border-red-200 rounded transition-colors" title="削除">
                       <Trash2 size={18} />
@@ -1920,7 +2364,7 @@ function App() {
       <header className="bg-gray-900 text-white p-3 shadow flex justify-between items-center flex-none">
         <div className="flex items-center gap-4">
           <button onClick={() => setCurrentContest(null)} className="hover:bg-gray-700 p-2 rounded"><ArrowLeft size={20} /></button>
-          <h1 className="text-lg font-bold flex items-center gap-2"><Code2 size={20} />{currentContest}</h1>
+          <h1 className="text-lg font-bold flex items-center gap-2"><Code2 size={20} />{currentContest}{config?.archived && <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-200 text-amber-950">Archived</span>}</h1>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -1961,6 +2405,11 @@ function App() {
             <div className={visData ? '' : 'max-w-7xl mx-auto w-full'}>
             <>
             <div className="bg-white border border-gray-300 rounded-lg shadow-sm flex flex-col h-[calc(100vh-140px)] min-h-[500px]">
+              {config?.archived && (
+                <div className="px-4 py-3 bg-amber-50 border-b border-amber-200 text-sm font-bold text-amber-800">
+                  このコンテストはアーカイブ済みです。提出やIO閲覧はできず、提出一覧と統計のみ閲覧できます。
+                </div>
+              )}
               <div className="p-3 border-b border-gray-200 flex gap-4 items-center bg-gray-50 rounded-t-lg overflow-x-auto">
                 <select value={language} onChange={(e) => {
                   const lang = e.target.value;
@@ -2014,16 +2463,69 @@ function App() {
                   >
                     <Copy size={13} /> 貼り付け
                   </button>
-                  <button disabled={isProcessing} onClick={handleSubmit} className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold py-1.5 px-6 rounded shadow flex items-center gap-2 transition-all whitespace-nowrap">
-                    {isProcessing ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} fill="currentColor" />}
-                    コンパイルして実行
+                  <button disabled={isProcessing || isSubmitting || !!config?.archived} onClick={handleSubmit} className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold py-1.5 px-6 rounded shadow flex items-center gap-2 transition-all whitespace-nowrap">
+                    {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} fill="currentColor" />}
+                    {currentRunningSubmissionId || currentQueuedCount > 0 ? '提出を追加' : 'コンパイルして実行'}
                   </button>
-                  {isProcessing && (
-                    <button onClick={() => { cancelRef.current = true; }} className="bg-red-500 hover:bg-red-600 text-white font-bold py-1.5 px-4 rounded shadow flex items-center gap-2 transition-all whitespace-nowrap">
+                  {currentCancellableSubmissionId && !config?.archived && (
+                    <button onClick={() => cancelSubmission(currentCancellableSubmissionId)} className="bg-red-500 hover:bg-red-600 text-white font-bold py-1.5 px-4 rounded shadow flex items-center gap-2 transition-all whitespace-nowrap">
                       ✕ キャンセル
                     </button>
                   )}
                 </div>
+              </div>
+              <div className="px-4 py-3 border-b border-gray-200 bg-white space-y-3">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-sm font-bold text-gray-700">実行モード:</span>
+                  <button onClick={() => setSubmitMode('regular')} className={`px-3 py-1.5 rounded-lg text-sm font-bold border ${submitMode === 'regular' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-600 border-gray-300 hover:border-blue-300'}`}>通常</button>
+                  <button onClick={() => setSubmitMode('favorites')} className={`px-3 py-1.5 rounded-lg text-sm font-bold border ${submitMode === 'favorites' ? 'bg-yellow-500 text-white border-yellow-500' : 'bg-white text-gray-600 border-gray-300 hover:border-yellow-300'}`}>お気に入り実行</button>
+                  <button onClick={() => setSubmitMode('filtered')} className={`px-3 py-1.5 rounded-lg text-sm font-bold border ${submitMode === 'filtered' ? 'bg-amber-600 text-white border-amber-600' : 'bg-white text-gray-600 border-gray-300 hover:border-amber-300'}`}>変数絞り込み</button>
+                </div>
+                {isCustomSubmitMode && (
+                  <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm font-bold text-amber-900">
+                    このモードの提出は一部ケースのみでの参考実行です。正規のスコアと一致しない可能性があります。
+                  </div>
+                )}
+                {submitMode === 'favorites' && (
+                  <p className="text-xs text-gray-600">
+                    お気に入り登録済みケースから昇順で `min(実行数, お気に入り数)` 件だけ実行します。
+                  </p>
+                )}
+                {submitMode === 'filtered' && (
+                  <div className="space-y-2">
+                    <p className="text-xs text-gray-600">
+                      条件に合うケースが `実行数` に達するまで入力生成を広げて探索します。30秒を超えたら、その時点で見つかった件数だけ実行します。
+                    </p>
+                    {submitActiveVars.length === 0 ? (
+                      <p className="text-xs text-red-600 font-bold">入力1行目の変数設定がないため、変数絞り込みは使えません。</p>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                        {submitActiveVars.map(v => (
+                          <div key={v} className="space-y-1">
+                            <label className="text-xs font-bold text-gray-600">{v}</label>
+                            <div className="flex items-center gap-2">
+                              <input
+                                type="number"
+                                placeholder="Min"
+                                className="w-full border p-1.5 text-sm rounded"
+                                value={submitVarFilters[v]?.min ?? ''}
+                                onChange={e => setSubmitVarFilters(prev => ({ ...prev, [v]: { ...prev[v], min: e.target.value ? Number(e.target.value) : '' } }))}
+                              />
+                              <span className="text-gray-400">-</span>
+                              <input
+                                type="number"
+                                placeholder="Max"
+                                className="w-full border p-1.5 text-sm rounded"
+                                value={submitVarFilters[v]?.max ?? ''}
+                                onChange={e => setSubmitVarFilters(prev => ({ ...prev, [v]: { ...prev[v], max: e.target.value ? Number(e.target.value) : '' } }))}
+                              />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
               {parallelism > logicalProcessorCount && (
                 <div className="px-3 py-2 bg-amber-50 border-b border-amber-200 text-xs text-amber-700 font-bold">
@@ -2103,11 +2605,23 @@ function App() {
                     // ケース数の種類を収集
                     const caseCountSet = new Set(sortedSubmissions.map((s: any) => s.testCases?.length ?? 0));
                     const caseCountOptions = [...caseCountSet].sort((a, b) => a - b);
-                    const filtered = caseCountFilter.size === 0
+                    let filtered = caseCountFilter.size === 0
                       ? sortedSubmissions
                       : sortedSubmissions.filter((s: any) => caseCountFilter.has(s.testCases?.length ?? 0));
+                    if (showSubmissionFavoritesOnly) {
+                      filtered = filtered.filter((s: any) => submissionFavorites.has(s.id));
+                    }
                     return (
                     <>
+                      <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
+                        <button
+                          onClick={() => { setShowSubmissionFavoritesOnly(v => !v); setSubPage(1); }}
+                          className={`px-3 py-1.5 rounded-lg text-sm font-bold border flex items-center gap-2 transition-colors ${showSubmissionFavoritesOnly ? 'bg-yellow-100 text-yellow-800 border-yellow-300' : 'bg-white text-gray-600 border-gray-300 hover:border-yellow-300 hover:text-yellow-700'}`}
+                        >
+                          <Star size={16} fill={showSubmissionFavoritesOnly ? 'currentColor' : 'none'} />
+                          {showSubmissionFavoritesOnly ? '提出お気に入りのみ表示中' : '提出お気に入りのみ表示'}
+                        </button>
+                      </div>
                       {caseCountOptions.length > 1 && (
                         <div className="flex items-center gap-2 mb-3 flex-wrap">
                           <span className="text-xs font-bold text-gray-500">ケース数:</span>
@@ -2135,13 +2649,14 @@ function App() {
                       <table className="w-full text-left border-collapse whitespace-nowrap">
                         <thead>
                           <tr className="bg-gray-100 border-b-2 border-gray-300 text-sm select-none">
+                            <th className="p-3 font-bold text-center w-12">★</th>
                             <th className="p-3 font-bold w-40 cursor-pointer hover:bg-gray-200 transition-colors" onClick={() => handleSubmissionSort('timestamp')}>提出日時 {submissionSort.key === 'timestamp' && (submissionSort.order === 'asc' ? '↑' : '↓')}</th>
                             <th className="p-3 font-bold">コード名</th>
-                            <th className="p-3 font-bold text-right cursor-pointer hover:bg-gray-200 transition-colors" onClick={() => handleSubmissionSort('totalScore')}>得点 {submissionSort.key === 'totalScore' && (submissionSort.order === 'asc' ? '↑' : '↓')}</th>
+                            <th className="p-3 font-bold text-right cursor-pointer hover:bg-gray-200 transition-colors" onClick={() => handleSubmissionSort('totalScore')}>{scoreColumnLabel} {submissionSort.key === 'totalScore' && (submissionSort.order === 'asc' ? '↑' : '↓')}</th>
                             <th className="p-3 font-bold text-right cursor-pointer hover:bg-gray-200 transition-colors text-blue-700" onClick={() => handleSubmissionSort('totalRelScore')}>相対スコア {submissionSort.key === 'totalRelScore' && (submissionSort.order === 'asc' ? '↑' : '↓')}</th>
+                            <th className="p-3 font-bold text-right cursor-pointer hover:bg-gray-200 transition-colors" onClick={() => handleSubmissionSort('uniqueCaseCount')}>ユニーク {submissionSort.key === 'uniqueCaseCount' && (submissionSort.order === 'asc' ? '↑' : '↓')}</th>
                             <th className="p-3 font-bold text-right cursor-pointer hover:bg-gray-200 transition-colors" onClick={() => handleSubmissionSort('codeLength')}>コード長 {submissionSort.key === 'codeLength' && (submissionSort.order === 'asc' ? '↑' : '↓')}</th>
                             <th className="p-3 font-bold text-right cursor-pointer hover:bg-gray-200 transition-colors" onClick={() => handleSubmissionSort('execTime')}>Max Time {submissionSort.key === 'execTime' && (submissionSort.order === 'asc' ? '↑' : '↓')}</th>
-                            <th className="p-3 font-bold text-center">メモリ</th>
                             <th className="p-3 font-bold text-center w-28">結果</th>
                             <th className="p-3 font-bold text-center w-24">操作</th>
                           </tr>
@@ -2149,21 +2664,36 @@ function App() {
                         <tbody>
                           {filtered.slice((subPage - 1) * subPageSize, subPage * subPageSize).map((sub: any) => (
                             <tr key={sub.id} className="border-b hover:bg-gray-50 transition-colors">
+                              <td className="p-3 text-center">
+                                <button
+                                  onClick={() => toggleSubmissionFavorite(sub.id)}
+                                  className={`inline-flex items-center justify-center transition-colors ${submissionFavorites.has(sub.id) ? 'text-yellow-500' : 'text-gray-300 hover:text-yellow-400'}`}
+                                  title={submissionFavorites.has(sub.id) ? '提出お気に入り解除' : '提出お気に入り'}
+                                >
+                                  <Star size={18} fill={submissionFavorites.has(sub.id) ? 'currentColor' : 'none'} />
+                                </button>
+                              </td>
                               <td className="p-3 text-sm text-gray-600">{sub.time}</td>
                               <td className="p-3">
-                                <div className="flex items-center gap-2 group">
+                                <div className="flex items-center gap-2 group flex-wrap">
                                   <input type="text" value={sub.name} onChange={(e) => updateSubName(sub.id, e.target.value)} className="border-b border-transparent hover:border-gray-300 focus:border-blue-500 focus:outline-none bg-transparent px-1 w-full max-w-[150px]" />
                                   <Edit2 size={12} className="text-gray-400 opacity-0 group-hover:opacity-100" />
+                                  {sub.executionTag && <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300">{sub.executionTag}</span>}
                                 </div>
                               </td>
-                              <td className="p-3 font-mono text-right font-bold text-blue-600">{sub.totalScore.toLocaleString()}</td>
+                              <td className="p-3 font-mono text-right font-bold text-blue-600">{formatSubmissionScore(sub)}</td>
                               <td className="p-3 font-mono text-right font-bold text-blue-600">{sub.totalRelScore.toLocaleString()}</td>
+                              <td className="p-3 font-mono text-right font-bold text-indigo-600">{sub.uniqueCaseCount.toLocaleString()}</td>
                               <td className="p-3 font-mono text-right text-sm">{sub.codeLength} B</td>
                               <td className="p-3 font-mono text-right text-sm">{sub.execTime.toFixed(3)} s</td>
-                              <td className="p-3 text-center text-sm text-gray-500">{sub.memory}</td>
                               <td className="p-3 text-center">{getStatusBadge(sub.status)}</td>
                               <td className="p-3 flex items-center justify-center gap-2">
-                                <button onClick={() => { setSelectedSubId(sub.id); setDetailTab('results'); }} className="text-blue-500 hover:text-blue-700 bg-blue-50 hover:bg-blue-100 px-2 py-1 rounded text-sm font-bold flex items-center">詳細</button>
+                                <button onClick={() => openSubmissionDetail(sub.id, 'submissions')} className="text-blue-500 hover:text-blue-700 bg-blue-50 hover:bg-blue-100 px-2 py-1 rounded text-sm font-bold flex items-center">詳細</button>
+                                {(sub.status === 'WJ' || sub.status === 'Compiling...' || String(sub.status).startsWith('Running')) && (
+                                  <button onClick={() => cancelSubmission(sub.id)} className="text-orange-500 hover:text-orange-700 p-1 rounded hover:bg-orange-50 transition-colors" title="キャンセル">
+                                    <StopCircle size={16} />
+                                  </button>
+                                )}
                                 <button onClick={(e) => handleDeleteSubmission(e, sub.id)} className="text-gray-400 hover:text-red-500 p-1 rounded hover:bg-red-50 transition-colors" title="削除"><Trash2 size={16} /></button>
                               </td>
                             </tr>
@@ -2181,10 +2711,30 @@ function App() {
 
               {selectedSubId && selectedSub && (
                 <div className="animate-in fade-in slide-in-from-right-4 duration-200">
+                  <div className="sticky top-0 z-20 -mx-6 mb-4 border-b border-gray-200 bg-white/95 px-6 py-3">
+                    <button
+                      onClick={closeSubmissionDetail}
+                      className="inline-flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-bold text-blue-800 shadow-sm transition-colors hover:bg-blue-100"
+                    >
+                      <ArrowLeft size={15} />
+                      {detailReturnTab === 'stats' ? '統計へ戻る' : '一覧へ戻る'}
+                    </button>
+                  </div>
                   <div className="flex flex-wrap justify-between items-center mb-6 border-b pb-4 gap-4">
                     <div>
-                      <button onClick={() => { setSelectedSubId(null); setDetailTab('results'); }} className="text-gray-500 hover:text-gray-800 flex items-center gap-1 text-sm font-bold mb-2"><ArrowLeft size={16} /> 一覧へ戻る</button>
-                      <h2 className="text-2xl font-bold flex items-center gap-2"><Trophy className="text-yellow-500" /> {selectedSub.name} の結果</h2>
+                      <div className="flex items-center gap-3 flex-wrap">
+                        <h2 className="text-2xl font-bold flex items-center gap-2"><Trophy className="text-yellow-500" /> {selectedSub.name} の結果</h2>
+                        {selectedSub.executionTag && (
+                          <span className="px-3 py-1 rounded-full bg-amber-100 text-amber-900 border border-amber-300 text-sm font-bold">
+                            {selectedSub.executionTag}
+                          </span>
+                        )}
+                        {(selectedSub.status === 'WJ' || selectedSub.status === 'Compiling...' || String(selectedSub.status).startsWith('Running')) && (
+                          <button onClick={() => cancelSubmission(selectedSub.id)} className="px-3 py-1.5 rounded-lg bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 text-sm font-bold flex items-center gap-2">
+                            <StopCircle size={15} /> この提出をキャンセル
+                          </button>
+                        )}
+                      </div>
                     </div>
                     <div className="text-right flex flex-wrap items-end gap-6">
                       <div>
@@ -2196,8 +2746,14 @@ function App() {
                         <p className="text-xl font-mono font-bold">{selectedSub.execTime.toFixed(3)}s</p>
                       </div>
                       <div>
-                        <p className="text-sm text-gray-500 font-bold mb-1">Total Score</p>
-                        <p className="text-3xl font-mono font-bold text-blue-600 leading-none">{selectedSub.totalScore.toLocaleString()}</p>
+                        <p className="text-sm text-gray-500 font-bold mb-1">{scoreColumnLabel}</p>
+                        <p className="text-3xl font-mono font-bold text-blue-600 leading-none">{formatSubmissionScore(selectedSub)}</p>
+                      </div>
+                      <div>
+                        <p className="text-sm text-gray-500 font-bold mb-1">ユニークケース数</p>
+                        <p className="text-2xl font-mono font-bold text-indigo-600 leading-none">
+                          {((selectedSub.testCases || []).reduce((acc, tc) => acc + (calcRelativeScore(tc, bestScores[tc.id]) === maxRelativeScore ? 1 : 0), 0)).toLocaleString()}
+                        </p>
                       </div>
                     </div>
                   </div>
@@ -2244,8 +2800,8 @@ function App() {
                           let valB = b[testCaseSort.key as keyof typeof b];
 
                           if (testCaseSort.key === 'relScore') {
-                            valA = calcRelativeScore(a.score, bestScores[a.id]);
-                            valB = calcRelativeScore(b.score, bestScores[b.id]);
+                            valA = calcRelativeScore(a, bestScores[a.id]);
+                            valB = calcRelativeScore(b, bestScores[b.id]);
                           }
 
                           if (valA < valB) return testCaseSort.order === 'asc' ? -1 : 1;
@@ -2256,6 +2812,18 @@ function App() {
 
                         return (
                           <>
+                            <div className="mb-3 flex items-center justify-between gap-3 flex-wrap">
+                              <div className="text-xs text-gray-500 font-bold">
+                                左端の星でケースをお気に入り登録できます。
+                              </div>
+                              <button
+                                onClick={() => { setShowFavoritesOnly(v => !v); setTcPage(1); }}
+                                className={`px-3 py-1.5 rounded-lg text-sm font-bold border flex items-center gap-2 transition-colors ${showFavoritesOnly ? 'bg-yellow-100 text-yellow-800 border-yellow-300' : 'bg-white text-gray-600 border-gray-300 hover:border-yellow-300 hover:text-yellow-700'}`}
+                              >
+                                <Star size={16} fill={showFavoritesOnly ? 'currentColor' : 'none'} />
+                                {showFavoritesOnly ? 'お気に入りのみ表示中' : 'お気に入りのみ表示'}
+                              </button>
+                            </div>
                             <Pagination page={tcPage} total={sortedCases.length} pageSize={tcPageSize}
                               onPage={setTcPage} onPageSize={setTcPageSize} />
                           <div className="overflow-x-auto">
@@ -2263,11 +2831,10 @@ function App() {
                             <thead>
                               <tr className="bg-gray-100 border-b-2 border-gray-300">
                                 <th className="p-3 font-bold w-8 text-center">
-                                  <button onClick={() => { setShowFavoritesOnly(v => !v); setTcPage(1); }}
-                                    title={showFavoritesOnly ? 'すべて表示' : 'お気に入りのみ'}
-                                    className={`transition-colors ${showFavoritesOnly ? 'text-yellow-400' : 'text-gray-300 hover:text-yellow-400'}`}>
-                                    <Star size={18} fill={showFavoritesOnly ? 'currentColor' : 'none'} />
-                                  </button>
+                                  <div className="flex flex-col items-center gap-1">
+                                    <Star size={18} className={showFavoritesOnly ? 'text-yellow-500' : 'text-gray-400'} fill={showFavoritesOnly ? 'currentColor' : 'none'} />
+                                    <span className="text-[10px] text-gray-500">お気に入り</span>
+                                  </div>
                                 </th>
                                 <th className="p-3 font-bold w-20 text-center cursor-pointer hover:bg-gray-200 transition-colors" onClick={() => handleTestCaseSort('id')}>Case {testCaseSort.key === 'id' && (testCaseSort.order === 'asc' ? '↑' : '↓')}</th>
                                 <th className="p-3 font-bold w-24 text-center cursor-pointer hover:bg-gray-200 transition-colors" onClick={() => handleTestCaseSort('status')}>Status {testCaseSort.key === 'status' && (testCaseSort.order === 'asc' ? '↑' : '↓')}</th>
@@ -2281,22 +2848,23 @@ function App() {
                             </thead>
                             <tbody>
                               {pagedCases.map((r) => {
-                                const relScore = calcRelativeScore(r.score, bestScores[r.id]);
+                                const relScore = calcRelativeScore(r, bestScores[r.id]);
                                 const bestForCase = getBestSubmissionsForCase(r.id);
                                 return (
                                   <React.Fragment key={r.id}>
                                     <tr className={`border-b hover:bg-gray-50 ${visData && r.id === Number(visData.input.match(/Case: (\d+)/)?.[1] || r.id) ? 'bg-blue-50' : ''}`}>
                                       <td className="p-3 text-center">
                                         <button onClick={() => toggleFavorite(r.id)}
-                                          className={`transition-colors ${favorites.has(r.id) ? 'text-yellow-400' : 'text-gray-200 hover:text-yellow-300'}`}
+                                          className={`inline-flex items-center gap-1 px-2 py-1 rounded-md border text-xs font-bold transition-colors ${favorites.has(r.id) ? 'bg-yellow-100 text-yellow-800 border-yellow-300' : 'bg-white text-gray-500 border-gray-200 hover:border-yellow-300 hover:text-yellow-700'}`}
                                           title={favorites.has(r.id) ? 'お気に入り解除' : 'お気に入りに追加'}>
                                           <Star size={18} fill={favorites.has(r.id) ? 'currentColor' : 'none'} />
+                                          <span>{favorites.has(r.id) ? '登録済み' : '登録'}</span>
                                         </button>
                                       </td>
                                       <td className="p-3 font-mono text-center text-gray-500">{String(r.id).padStart(4, '0')}</td>
                                       <td className="p-3 text-center">{getStatusBadge(r.status)}</td>
                                       <td className="p-3 font-mono text-right text-gray-600">{r.time.toFixed(3)}s</td>
-                                      <td className="p-3 font-mono text-right font-bold">{r.score > 0 ? r.score.toLocaleString() : '-'}</td>
+                                      <td className="p-3 font-mono text-right font-bold">{isAcceptedResult(r) || r.score > 0 ? r.score.toLocaleString() : '-'}</td>
                                       <td className="p-3 text-right">
                                         <span
                                           className="inline-block font-mono font-bold text-blue-600 border-b border-dotted border-blue-300 cursor-help"
@@ -2316,13 +2884,14 @@ function App() {
                                         </span>
                                       </td>
                                       <td className="p-3 text-center">
-                                        <button onClick={() => openVisualizer(r.id, selectedSub.id)} className="text-gray-600 hover:text-blue-600 p-1 hover:bg-blue-50 rounded transition-colors" title="アプリ内でビジュアライザを再生"><Play size={18} /></button>
+                                        <button disabled={!!config?.archived} onClick={() => openVisualizer(r.id, selectedSub.id)} className="text-gray-600 hover:text-blue-600 p-1 hover:bg-blue-50 rounded transition-colors disabled:opacity-30 disabled:hover:bg-transparent" title={config?.archived ? 'アーカイブ済みのため利用できません' : 'アプリ内でビジュアライザを再生'}><Play size={18} /></button>
                                       </td>
                                       <td className="p-3 text-center">
                                         <button
+                                          disabled={!!config?.archived}
                                           onClick={() => toggleCaseIO(r.id, selectedSub.id)}
-                                          className={`px-2 py-1 rounded text-xs font-bold transition-colors ${expandedCaseIO[r.id] !== undefined ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
-                                          title="入出力を表示"
+                                          className={`px-2 py-1 rounded text-xs font-bold transition-colors disabled:opacity-40 ${expandedCaseIO[r.id] !== undefined ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
+                                          title={config?.archived ? 'アーカイブ済みのため利用できません' : '入出力を表示'}
                                         >
                                           {expandedCaseIO[r.id] === 'loading' ? '...' : 'IO'}
                                         </button>
@@ -2387,12 +2956,27 @@ function App() {
                         );
                       })()}
                     </div>
-                  ) : (
-                    <div className="h-[500px] border border-gray-300 rounded-lg overflow-hidden relative">
-                      <div className="absolute top-2 right-3 z-10">
-                        <CopyButton text={selectedSub.code} className="shadow-sm" />
+                  ) : selectedSub.code ? (
+                    <div className="space-y-3">
+                      {selectedSub.compileError && (
+                        <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+                          <div className="flex items-center justify-between mb-2">
+                            <p className="text-sm font-bold text-red-700">コンパイルエラー</p>
+                            <CopyButton text={selectedSub.compileError} />
+                          </div>
+                          <pre className="text-xs font-mono whitespace-pre-wrap break-all text-red-700">{selectedSub.compileError}</pre>
+                        </div>
+                      )}
+                      <div className="h-[500px] border border-gray-300 rounded-lg overflow-hidden relative">
+                        <div className="absolute top-2 right-3 z-10">
+                          <CopyButton text={selectedSub.code} className="shadow-sm" />
+                        </div>
+                        <Editor language={selectedSub.language === 'python' ? 'python' : selectedSub.language === 'rust' ? 'rust' : 'cpp'} theme="vs-light" value={selectedSub.code} options={{ readOnly: true, minimap: { enabled: false }, fontSize: 14 }} />
                       </div>
-                      <Editor language={selectedSub.language === 'python' ? 'python' : selectedSub.language === 'rust' ? 'rust' : 'cpp'} theme="vs-light" value={selectedSub.code} options={{ readOnly: true, minimap: { enabled: false }, fontSize: 14 }} />
+                    </div>
+                  ) : (
+                    <div className="h-[240px] border border-dashed border-amber-300 rounded-lg bg-amber-50 flex items-center justify-center text-sm font-bold text-amber-800">
+                      アーカイブ済みのため提出コードは削除されています。
                     </div>
                   )}
                 </div>
@@ -2436,15 +3020,20 @@ function App() {
                       <thead>
                         <tr className="bg-gray-50 border-b text-gray-500 text-xs">
                           <th className="py-2 px-3 font-normal w-8"></th>
-                          <th className="py-2 px-3 font-normal w-36">提出日時</th>
-                          <th className="py-2 px-3 font-normal">コード名</th>
-                          <th className="py-2 px-3 font-normal text-right">得点</th>
-                          <th className="py-2 px-3 font-normal text-right">相対スコア</th>
-                          <th className="py-2 px-3 font-normal text-center">結果</th>
+                          <th className="py-2 px-3 font-normal w-10 text-center">★</th>
+                          <th className="py-2 px-3 font-normal w-36 cursor-pointer" onClick={() => handleStatsSubmissionSort('timestamp')}>提出日時 {statsSubmissionSort.key === 'timestamp' && (statsSubmissionSort.order === 'asc' ? '↑' : '↓')}</th>
+                          <th className="py-2 px-3 font-normal cursor-pointer" onClick={() => handleStatsSubmissionSort('name')}>コード名 {statsSubmissionSort.key === 'name' && (statsSubmissionSort.order === 'asc' ? '↑' : '↓')}</th>
+                          <th className="py-2 px-3 font-normal text-right cursor-pointer" onClick={() => handleStatsSubmissionSort('totalScore')}>{scoreColumnLabel} {statsSubmissionSort.key === 'totalScore' && (statsSubmissionSort.order === 'asc' ? '↑' : '↓')}</th>
+                          <th className="py-2 px-3 font-normal text-right cursor-pointer" onClick={() => handleStatsSubmissionSort('totalRelScore')}>相対スコア {statsSubmissionSort.key === 'totalRelScore' && (statsSubmissionSort.order === 'asc' ? '↑' : '↓')}</th>
+                          <th className="py-2 px-3 font-normal text-right cursor-pointer" onClick={() => handleStatsSubmissionSort('uniqueCaseCount')}>ユニーク {statsSubmissionSort.key === 'uniqueCaseCount' && (statsSubmissionSort.order === 'asc' ? '↑' : '↓')}</th>
+                          <th className="py-2 px-3 font-normal text-center cursor-pointer" onClick={() => handleStatsSubmissionSort('status')}>結果 {statsSubmissionSort.key === 'status' && (statsSubmissionSort.order === 'asc' ? '↑' : '↓')}</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {sortedSubmissions.slice((statsSubPage - 1) * statsSubPageSize, statsSubPage * statsSubPageSize).map((sub: any) => {
+                        {statsSortedSubmissions
+                          .filter((sub: any) => !showSubmissionFavoritesOnly || submissionFavorites.has(sub.id))
+                          .slice((statsSubPage - 1) * statsSubPageSize, statsSubPage * statsSubPageSize)
+                          .map((sub: any) => {
                           const checked = selectedForStats.has(sub.id);
                           const colorIdx = Array.from(selectedForStats).indexOf(sub.id);
                           const color = checked ? CHART_COLORS[colorIdx % CHART_COLORS.length] : undefined;
@@ -2461,10 +3050,34 @@ function App() {
                               <td className="py-2 px-3">
                                 <div className="w-3 h-3 rounded-full border-2 transition-all" style={checked ? { background: color, borderColor: color } : { borderColor: '#d1d5db' }} />
                               </td>
+                              <td className="py-2 px-3 text-center">
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    toggleSubmissionFavorite(sub.id);
+                                  }}
+                                  className={`inline-flex items-center justify-center transition-colors ${submissionFavorites.has(sub.id) ? 'text-yellow-500' : 'text-gray-300 hover:text-yellow-400'}`}
+                                  title={submissionFavorites.has(sub.id) ? '提出お気に入り解除' : '提出お気に入り'}
+                                >
+                                  <Star size={16} fill={submissionFavorites.has(sub.id) ? 'currentColor' : 'none'} />
+                                </button>
+                              </td>
                               <td className="py-2 px-3 text-gray-500">{sub.time}</td>
-                              <td className="py-2 px-3 font-bold" style={checked ? { color } : { color: '#374151' }}>{sub.name}</td>
-                              <td className="py-2 px-3 font-mono text-right text-blue-600 font-bold">{sub.totalScore.toLocaleString()}</td>
+                              <td className="py-2 px-3 font-bold">
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    openSubmissionDetail(sub.id, 'stats');
+                                  }}
+                                  className="hover:underline"
+                                  style={checked ? { color } : { color: '#374151' }}
+                                >
+                                  {sub.name}
+                                </button>
+                              </td>
+                              <td className="py-2 px-3 font-mono text-right text-blue-600 font-bold">{formatSubmissionScore(sub)}</td>
                               <td className="py-2 px-3 font-mono text-right text-blue-600 font-bold">{sub.totalRelScore.toLocaleString()}</td>
+                              <td className="py-2 px-3 font-mono text-right text-indigo-600 font-bold">{sub.uniqueCaseCount.toLocaleString()}</td>
                               <td className="py-2 px-3 text-center">{getStatusBadge(sub.status)}</td>
                             </tr>
                           );
@@ -2472,9 +3085,18 @@ function App() {
                       </tbody>
                     </table>
                     <div className="px-3">
+                      <div className="py-3 flex items-center justify-between gap-3 flex-wrap">
+                        <button
+                          onClick={() => { setShowSubmissionFavoritesOnly(v => !v); setStatsSubPage(1); }}
+                          className={`px-3 py-1.5 rounded-lg text-sm font-bold border flex items-center gap-2 transition-colors ${showSubmissionFavoritesOnly ? 'bg-yellow-100 text-yellow-800 border-yellow-300' : 'bg-white text-gray-600 border-gray-300 hover:border-yellow-300 hover:text-yellow-700'}`}
+                        >
+                          <Star size={16} fill={showSubmissionFavoritesOnly ? 'currentColor' : 'none'} />
+                          {showSubmissionFavoritesOnly ? '提出お気に入りのみ表示中' : '提出お気に入りのみ表示'}
+                        </button>
+                      </div>
                       <Pagination
                         page={statsSubPage}
-                        total={sortedSubmissions.length}
+                        total={statsSortedSubmissions.filter((sub: any) => !showSubmissionFavoritesOnly || submissionFavorites.has(sub.id)).length}
                         pageSize={statsSubPageSize}
                         onPage={setStatsSubPage}
                         onPageSize={setStatsSubPageSize}
@@ -2504,7 +3126,7 @@ function App() {
                   <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
                     {/* 左カラム：フィルタ設定 */}
                     <div className="lg:col-span-1 bg-white p-4 rounded-xl shadow-sm border border-gray-200 h-fit space-y-4">
-                      <h3 className="font-bold text-gray-700 border-b pb-2">X軸・フィルター</h3>
+                      <h3 className="font-bold text-gray-700 border-b pb-2">フィルター</h3>
                       <div>
                         <label className="text-xs font-bold text-gray-500 uppercase tracking-wide mb-1 block">Y軸</label>
                         <div className="flex gap-1">
@@ -2518,72 +3140,49 @@ function App() {
                           >相対スコア</button>
                         </div>
                       </div>
-                      {/* X軸モード */}
-                      <div>
-                        <label className="text-xs font-bold text-gray-500 uppercase tracking-wide mb-1 block">X軸</label>
-                        <div className="flex gap-1">
-                          <button
-                            onClick={() => setStatsXAxisMode('auto')}
-                            className={`flex-1 py-1.5 text-xs font-bold rounded transition-colors ${statsXAxisMode === 'auto' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
-                          >変数</button>
-                          <button
-                            onClick={() => setStatsXAxisMode('seed')}
-                            className={`flex-1 py-1.5 text-xs font-bold rounded transition-colors ${statsXAxisMode === 'seed' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
-                          >seed</button>
-                        </div>
+                      <h3 className="font-bold text-gray-700 border-b pb-2 pt-1">seedフィルター</h3>
+                      <div className="space-y-1">
+                        <label className="text-xs font-bold text-gray-500 uppercase tracking-wide block">開始 seed</label>
+                        <input type="number" min="0" placeholder="0" className="w-full border p-1.5 text-sm rounded"
+                          value={seedRange.min}
+                          onChange={e => setSeedRange(r => ({ ...r, min: e.target.value ? Number(e.target.value) : '' }))} />
                       </div>
-                      {statsXAxisMode === 'seed' && (
-                        <>
-                          <h3 className="font-bold text-gray-700 border-b pb-2 pt-1">seedフィルター</h3>
-                          <div className="space-y-1">
-                            <label className="text-xs font-bold text-gray-500 uppercase tracking-wide block">開始 seed</label>
-                            <input type="number" min="0" placeholder="0" className="w-full border p-1.5 text-sm rounded"
-                              value={seedRange.min}
-                              onChange={e => setSeedRange(r => ({ ...r, min: e.target.value ? Number(e.target.value) : '' }))} />
+                      <div className="space-y-1">
+                        <label className="text-xs font-bold text-gray-500 uppercase tracking-wide block">終了 seed</label>
+                        <input type="number" min="0" placeholder="上限なし" className="w-full border p-1.5 text-sm rounded"
+                          value={seedRange.max}
+                          onChange={e => setSeedRange(r => ({ ...r, max: e.target.value ? Number(e.target.value) : '' }))} />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-xs font-bold text-gray-500 uppercase tracking-wide block">お気に入りのみ</label>
+                        <label className="flex items-center gap-2 cursor-pointer">
+                          <input type="checkbox" checked={showFavoritesOnly}
+                            onChange={e => setShowFavoritesOnly(e.target.checked)}
+                            className="w-4 h-4 text-yellow-400" />
+                          <span className="text-sm text-gray-600 flex items-center gap-1"><Star size={13} className="text-yellow-400" fill="currentColor" /> お気に入りに絞る</span>
+                        </label>
+                      </div>
+                      <h3 className="font-bold text-gray-700 border-b pb-2 pt-1">変数フィルター</h3>
+                      {[SCORE_FILTER_KEY, ...activeVars].map(v => (
+                        <div key={v} className="space-y-1">
+                          <label className="text-sm font-bold text-gray-600">{v === SCORE_FILTER_KEY ? '絶対スコア' : v}</label>
+                          <div className="flex items-center gap-2">
+                            <input type="number" placeholder="Min" className="w-full border p-1.5 text-sm rounded"
+                              value={varFilters[v]?.min ?? ''}
+                              onChange={e => setVarFilters({ ...varFilters, [v]: { ...varFilters[v], min: e.target.value ? Number(e.target.value) : '' } })} />
+                            <span className="text-gray-400">-</span>
+                            <input type="number" placeholder="Max" className="w-full border p-1.5 text-sm rounded"
+                              value={varFilters[v]?.max ?? ''}
+                              onChange={e => setVarFilters({ ...varFilters, [v]: { ...varFilters[v], max: e.target.value ? Number(e.target.value) : '' } })} />
                           </div>
-                          <div className="space-y-1">
-                            <label className="text-xs font-bold text-gray-500 uppercase tracking-wide block">終了 seed</label>
-                            <input type="number" min="0" placeholder="上限なし" className="w-full border p-1.5 text-sm rounded"
-                              value={seedRange.max}
-                              onChange={e => setSeedRange(r => ({ ...r, max: e.target.value ? Number(e.target.value) : '' }))} />
-                          </div>
-                          <div className="space-y-1">
-                            <label className="text-xs font-bold text-gray-500 uppercase tracking-wide block">お気に入りのみ</label>
-                            <label className="flex items-center gap-2 cursor-pointer">
-                              <input type="checkbox" checked={showFavoritesOnly}
-                                onChange={e => setShowFavoritesOnly(e.target.checked)}
-                                className="w-4 h-4 text-yellow-400" />
-                              <span className="text-sm text-gray-600 flex items-center gap-1"><Star size={13} className="text-yellow-400" fill="currentColor" /> お気に入りに絞る</span>
-                            </label>
-                          </div>
-                        </>
-                      )}
-                      {statsXAxisMode === 'auto' && (
-                        <>
-                          <h3 className="font-bold text-gray-700 border-b pb-2 pt-1">変数フィルター</h3>
-                          {[SCORE_FILTER_KEY, ...activeVars].map(v => (
-                            <div key={v} className="space-y-1">
-                              <label className="text-sm font-bold text-gray-600">{v === SCORE_FILTER_KEY ? '絶対スコア' : v}</label>
-                              <div className="flex items-center gap-2">
-                                <input type="number" placeholder="Min" className="w-full border p-1.5 text-sm rounded"
-                                  value={varFilters[v]?.min ?? ''}
-                                  onChange={e => setVarFilters({ ...varFilters, [v]: { ...varFilters[v], min: e.target.value ? Number(e.target.value) : '' } })} />
-                                <span className="text-gray-400">-</span>
-                                <input type="number" placeholder="Max" className="w-full border p-1.5 text-sm rounded"
-                                  value={varFilters[v]?.max ?? ''}
-                                  onChange={e => setVarFilters({ ...varFilters, [v]: { ...varFilters[v], max: e.target.value ? Number(e.target.value) : '' } })} />
-                              </div>
-                            </div>
-                          ))}
-                          {activeVars.length === 0 && <p className="text-sm text-gray-500">変数がないため、絶対スコアのみ絞り込めます</p>}
-                        </>
-                      )}
+                        </div>
+                      ))}
+                      {activeVars.length === 0 && <p className="text-sm text-gray-500">変数がないため、絶対スコアのみ絞り込めます</p>}
                     </div>
 
                     {/* 右カラム：グラフ + サマリー */}
                     <div className="lg:col-span-3 space-y-6">
-                      {statsXAxisMode === 'seed' ? (() => {
-                        // ── seed 折れ線グラフ ──
+                      {(() => {
                         const onHover = (info: HoverInfo) => { setStatsPointTooltip(info); hoveredPointRef.current = { id: info.id }; };
                         const onLeave = () => setStatsPointTooltip(null);
                         const onClickPoint = (id: number, subId: string) => {
@@ -2599,6 +3198,8 @@ function App() {
                               if (typeof seedRange.min === 'number' && tc.id < seedRange.min) return false;
                               if (typeof seedRange.max === 'number' && tc.id > seedRange.max) return false;
                               if (showFavoritesOnly && !favorites.has(tc.id)) return false;
+                              if (!passesAbsoluteScoreFilter(tc, varFilters)) return false;
+                              if (!passesVariableFilters(tc, activeVars, testcaseVars, varFilters)) return false;
                               return true;
                             })
                             .map((tc: any) => {
@@ -2614,7 +3215,7 @@ function App() {
                         const yDomain: [number, number] = [globalYMin - yPadding, globalYMax + yPadding];
 
                         return (
-                          <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
+                          <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200" style={deferredSectionStyle}>
                             <div className="flex justify-between items-end mb-3 border-b pb-2 flex-wrap gap-2">
                               <h3 className="font-bold text-lg text-gray-800">
                                 {`seed vs ${scoreModeLabel}`}
@@ -2646,7 +3247,9 @@ function App() {
                             />
                           </div>
                         );
-                      })() : activeVars.map(v => {
+                      })()}
+
+                      {activeVars.map(v => {
                         let uniqueValues = new Set<number>();
                         let globalYMin = Infinity, globalYMax = -Infinity;
 
@@ -2656,13 +3259,14 @@ function App() {
                           sub.testCases?.forEach((tc: any) => {
                             const val = testcaseVars[tc.id]?.[v];
                             if (val === undefined) return;
+                            if (typeof seedRange.min === 'number' && tc.id < seedRange.min) return;
+                            if (typeof seedRange.max === 'number' && tc.id > seedRange.max) return;
+                            if (showFavoritesOnly && !favorites.has(tc.id)) return;
                             const fMin = varFilters[v]?.min, fMax = varFilters[v]?.max;
                             if (typeof fMin === 'number' && val < fMin) return;
                             if (typeof fMax === 'number' && val > fMax) return;
-                            const scoreFilterMin = varFilters[SCORE_FILTER_KEY]?.min;
-                            const scoreFilterMax = varFilters[SCORE_FILTER_KEY]?.max;
-                            if (typeof scoreFilterMin === 'number' && tc.score < scoreFilterMin) return;
-                            if (typeof scoreFilterMax === 'number' && tc.score > scoreFilterMax) return;
+                            if (!passesAbsoluteScoreFilter(tc, varFilters)) return;
+                            if (!passesVariableFilters(tc, activeVars.filter(name => name !== v), testcaseVars, varFilters)) return;
                             const score = getScoreByMode(tc, statsScoreMode);
                             uniqueValues.add(val);
                             subData.push({ x: val, y: score, id: tc.id });
@@ -2703,13 +3307,14 @@ function App() {
                                 ?.filter((tc: any) => {
                                   const val = testcaseVars[tc.id]?.[v];
                                   if (val !== xVal) return false;
+                                  if (typeof seedRange.min === 'number' && tc.id < seedRange.min) return false;
+                                  if (typeof seedRange.max === 'number' && tc.id > seedRange.max) return false;
+                                  if (showFavoritesOnly && !favorites.has(tc.id)) return false;
                                   const fMin = varFilters[v]?.min, fMax = varFilters[v]?.max;
                                   if (typeof fMin === 'number' && val < fMin) return false;
                                   if (typeof fMax === 'number' && val > fMax) return false;
-                                  const scoreFilterMin = varFilters[SCORE_FILTER_KEY]?.min;
-                                  const scoreFilterMax = varFilters[SCORE_FILTER_KEY]?.max;
-                                  if (typeof scoreFilterMin === 'number' && tc.score < scoreFilterMin) return false;
-                                  if (typeof scoreFilterMax === 'number' && tc.score > scoreFilterMax) return false;
+                                  if (!passesAbsoluteScoreFilter(tc, varFilters)) return false;
+                                  if (!passesVariableFilters(tc, activeVars.filter(name => name !== v), testcaseVars, varFilters)) return false;
                                   return true;
                                 })
                                 .map((tc: any) => ({ score: getScoreByMode(tc, statsScoreMode), id: tc.id })) || [];
@@ -2725,7 +3330,7 @@ function App() {
                           });
 
                           return (
-                            <div key={v} className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
+                            <div key={v} className="bg-white p-4 rounded-xl shadow-sm border border-gray-200" style={deferredSectionStyle}>
                               <div className="flex justify-between items-end mb-3 border-b pb-2 flex-wrap gap-2">
                                 <h3 className="font-bold text-lg text-gray-800">
                                   {`${v} vs ${scoreModeLabel}`}
@@ -2762,7 +3367,7 @@ function App() {
 
                         // ── 散布図 ──
                         return (
-                          <div key={v} className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
+                          <div key={v} className="bg-white p-4 rounded-xl shadow-sm border border-gray-200" style={deferredSectionStyle}>
                             <div className="flex justify-between items-end mb-3 border-b pb-2 flex-wrap gap-2">
                               <h3 className="font-bold text-lg text-gray-800">{`${v} vs ${scoreModeLabel}`}</h3>
                               <div className="text-sm">
@@ -2798,8 +3403,8 @@ function App() {
                       })}
 
                       {/* ── 提出ごとのサマリーテーブル ── */}
-                      <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
-                        <h3 className="font-bold text-lg text-gray-800 mb-1 border-b pb-2">{`提出サマリー（全テストケース / ${scoreModeLabel}）`}</h3>
+                      <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200" style={deferredSectionStyle}>
+                        <h3 className="font-bold text-lg text-gray-800 mb-1 border-b pb-2">{`提出サマリー（フィルター適用後 / ${scoreModeLabel}）`}</h3>
                         <p className="text-xs text-gray-400 mb-3">最大・Q3・中央値・Q1・最小はクリックでビジュアライザを開きます</p>
                         <div className="overflow-x-auto">
                           <table className="w-full text-sm text-right">
@@ -2819,7 +3424,16 @@ function App() {
                             <tbody>
                               {compareSubmissions.map((sub) => {
                                 const ci = subColorMap[sub.id] ?? 0;
-                                const entries = sub.testCases?.map(tc => ({ score: getScoreByMode(tc, statsScoreMode), id: tc.id })) || [];
+                                const entries = sub.testCases
+                                  ?.filter(tc => {
+                                    if (typeof seedRange.min === 'number' && tc.id < seedRange.min) return false;
+                                    if (typeof seedRange.max === 'number' && tc.id > seedRange.max) return false;
+                                    if (showFavoritesOnly && !favorites.has(tc.id)) return false;
+                                    if (!passesAbsoluteScoreFilter(tc, varFilters)) return false;
+                                    if (!passesVariableFilters(tc, activeVars, testcaseVars, varFilters)) return false;
+                                    return true;
+                                  })
+                                  .map(tc => ({ score: getScoreByMode(tc, statsScoreMode), id: tc.id })) || [];
                                 const st = calcBoxStatsWithIds(entries);
                                 const fmt = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 1 });
                                 const VisTd = ({ score, id, bold }: { score: number; id: number; bold?: boolean }) => (
@@ -3317,6 +3931,30 @@ function App() {
                   </div>
                 </div>
 
+                <div>
+                  <label className="block text-sm font-bold text-gray-700 mb-2">得点表示</label>
+                  <div className="flex gap-4">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="radio"
+                        checked={(editingConfig.score_display ?? 'sum') === 'sum'}
+                        onChange={() => setEditingConfig({ ...editingConfig, score_display: 'sum' })}
+                        className="w-4 h-4 text-blue-600"
+                      />
+                      <span>総和</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="radio"
+                        checked={(editingConfig.score_display ?? 'sum') === 'average'}
+                        onChange={() => setEditingConfig({ ...editingConfig, score_display: 'average' })}
+                        className="w-4 h-4 text-blue-600"
+                      />
+                      <span>平均</span>
+                    </label>
+                  </div>
+                </div>
+
                 {/* 変数フォーマット */}
                 <div>
                   <label className="block text-sm font-bold text-gray-700 mb-1">入力1行目の変数 (スペース区切り)</label>
@@ -3336,7 +3974,7 @@ function App() {
                   <p className="text-xs text-gray-500 mb-3">公式の配布ツール(ZIP)を選択して上書き展開します。</p>
                   <button
                     onClick={handleSelectToolsZip}
-                    disabled={isProcessing}
+                    disabled={isProcessing || !!editingConfig.archived}
                     className="px-4 py-2 bg-white hover:bg-gray-50 text-gray-700 rounded-lg border border-gray-300 shadow-sm transition-colors flex items-center gap-2 font-bold disabled:opacity-50"
                   >
                     <Folder size={18} className="text-blue-500" />
@@ -3358,7 +3996,7 @@ function App() {
                         showStatus('error', 'キャッシュ削除に失敗しました: ' + String(e));
                       }
                     }}
-                    disabled={isProcessing}
+                    disabled={isProcessing || !!editingConfig.archived}
                     className="px-4 py-2 bg-white hover:bg-gray-50 text-gray-700 rounded-lg border border-gray-300 shadow-sm transition-colors flex items-center gap-2 font-bold disabled:opacity-50"
                   >
                     <Eye size={18} className="text-purple-500" />
@@ -3376,6 +4014,7 @@ function App() {
                     </div>
                     <button
                       onClick={() => { handleGenerateInputs(); setIsSettingsOpen(false); }}
+                      disabled={!!editingConfig.archived}
                       className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg flex items-center gap-2 font-bold shadow-sm transition-colors"
                     >
                       <Plus size={16} /> 生成を実行
@@ -3466,8 +4105,8 @@ function App() {
         {/* 右側エリア（ビジュアライザ）— 独立スクロール不可・高さ固定 */}
         {visData && (
           <div className="w-[50%] min-w-[440px] max-w-[60%] min-h-0 border-l border-gray-300 bg-white flex flex-col overflow-hidden shadow-[-8px_0_16px_-8px_rgba(0,0,0,0.08)] z-10">
-            <div className="p-3 bg-gray-50 border-b flex justify-between items-center flex-none">
-              <div className="flex items-center gap-4">
+            <div className="p-3 bg-gray-50 border-b flex justify-between items-center gap-3 flex-wrap flex-none">
+              <div className="flex items-center gap-4 flex-wrap">
                 <h3 className="font-bold flex items-center gap-2 text-gray-800"><Eye size={18} className="text-blue-500" /> Visualizer</h3>
                 {visData.web_url && (
                   <button onClick={handleOpenWebVis} className="text-blue-600 hover:text-blue-800 text-sm font-bold flex items-center gap-1 underline transition-colors" title="外部ブラウザで開く">
@@ -3475,14 +4114,65 @@ function App() {
                   </button>
                 )}
               </div>
-              <button onClick={() => { setVisDataSynced(null); setCurrentVisId(null); }} className="px-4 py-1.5 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-md font-bold transition-colors text-sm">閉じる</button>
+              <div className="flex items-center gap-2 flex-wrap justify-end">
+                <div className="flex items-center gap-1 rounded-md border border-gray-300 bg-white p-1">
+                  {[50, 67, 75, 90, 100, 125, 150, 200].map((value) => (
+                    <button
+                      key={value}
+                      onClick={() => setVisZoom(value)}
+                      className={`px-2 py-1 rounded text-xs font-bold transition-colors ${visZoom === value ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-100'}`}
+                    >
+                      {value}%
+                    </button>
+                  ))}
+                </div>
+                <button
+                  onClick={() => { setVisZoom(90); }}
+                  className="px-3 py-1.5 bg-white hover:bg-gray-100 text-gray-700 rounded-md border border-gray-300 font-bold transition-colors text-xs"
+                >
+                  表示リセット
+                </button>
+                <button onClick={() => { setVisDataSynced(null); setCurrentVisId(null); }} className="px-4 py-1.5 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-md font-bold transition-colors text-sm">閉じる</button>
+              </div>
             </div>
-            <div className="flex-1 overflow-hidden relative">
-              {visData.local_url ? (
-                <iframe ref={visIframeRef} src={visData.local_url} className="absolute inset-0 w-full h-full border-0" />
-              ) : (
-                <iframe ref={visIframeRef} srcDoc={visData.html} className="absolute inset-0 w-full h-full border-0" />
-              )}
+            <div className="flex-1 overflow-x-auto overflow-y-auto bg-gray-100 p-3">
+              <div className="h-full min-h-[480px] min-w-full">
+                <div
+                  className="relative h-full min-h-[480px] overflow-hidden rounded-lg border border-gray-300 bg-white shadow-sm"
+                  style={{
+                    width: `${visOuterScale * 100}%`,
+                    minWidth: '100%',
+                  }}
+                >
+                  {visData.local_url ? (
+                    <iframe
+                      ref={visIframeRef}
+                      src={visData.local_url}
+                      className="absolute left-0 top-0 border-0 bg-white"
+                      style={{
+                        width: `${visInnerBase}%`,
+                        height: `${visInnerBase}%`,
+                        minHeight: '100%',
+                        transform: `scale(${visScale})`,
+                        transformOrigin: 'top left',
+                      }}
+                    />
+                  ) : (
+                    <iframe
+                      ref={visIframeRef}
+                      srcDoc={visData.html}
+                      className="absolute left-0 top-0 border-0 bg-white"
+                      style={{
+                        width: `${visInnerBase}%`,
+                        height: `${visInnerBase}%`,
+                        minHeight: '100%',
+                        transform: `scale(${visScale})`,
+                        transformOrigin: 'top left',
+                      }}
+                    />
+                  )}
+                </div>
+              </div>
             </div>
           </div>
         )}

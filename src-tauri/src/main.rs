@@ -31,6 +31,7 @@ struct VisualizerData {
 struct ContestItem {
     name: String,
     updated_at: u64,
+    archived: bool,
 }
 
 /// ドキュメントフォルダ内の共通ワークスペースディレクトリを返す
@@ -164,6 +165,53 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\"'\"'"))
 }
 
+fn load_contest_config_sync(contest_dir: &Path, contest_name: &str) -> ContestConfig {
+    let config_file = contest_dir.join("config.json");
+    if config_file.exists() {
+        let content = fs::read_to_string(config_file).unwrap_or_else(|_| "{}".to_string());
+        let mut config: ContestConfig = serde_json::from_str(&content).unwrap_or_default();
+        config.name = contest_name.to_string();
+        config
+    } else {
+        let mut config = ContestConfig::default();
+        config.name = contest_name.to_string();
+        config
+    }
+}
+
+fn ensure_contest_not_archived(contest_dir: &Path, contest_name: &str) -> Result<(), String> {
+    let config = load_contest_config_sync(contest_dir, contest_name);
+    if config.archived {
+        Err("このコンテストはアーカイブ済みです".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn extract_zip_bytes(target_dir: &Path, zip_bytes: &[u8]) -> Result<(), String> {
+    let reader = std::io::Cursor::new(zip_bytes);
+    let mut archive = zip::ZipArchive::new(reader).map_err(|e| format!("ZIP読込失敗: {}", e))?;
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+        let outpath = match file.enclosed_name() {
+            Some(p) => target_dir.join(p),
+            None => continue,
+        };
+        if (*file.name()).ends_with('/') {
+            fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
+        } else {
+            if let Some(p) = outpath.parent() {
+                fs::create_dir_all(p).map_err(|e| e.to_string())?;
+            }
+            let mut outfile = fs::File::create(&outpath).map_err(|e| e.to_string())?;
+            io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 fn get_contests() -> Result<Vec<ContestItem>, String> {
     let mut contests = Vec::new();
@@ -174,6 +222,7 @@ fn get_contests() -> Result<Vec<ContestItem>, String> {
             for entry in entries.flatten() {
                 if entry.file_type().map(|f| f.is_dir()).unwrap_or(false) {
                     let name = entry.file_name().to_string_lossy().to_string();
+                    let config = load_contest_config_sync(&entry.path(), &name);
 
                     // フォルダの最終更新日時を取得（取得失敗時は現在時刻）
                     let updated_at = entry
@@ -184,7 +233,11 @@ fn get_contests() -> Result<Vec<ContestItem>, String> {
                         .unwrap_or_default()
                         .as_secs();
 
-                    contests.push(ContestItem { name, updated_at });
+                    contests.push(ContestItem {
+                        name,
+                        updated_at,
+                        archived: config.archived,
+                    });
                 }
             }
         }
@@ -232,6 +285,38 @@ async fn create_contest(
         tools_dir: target_dir.to_string_lossy().to_string(),
         optimize_target,
         variables,
+        score_display: "sum".to_string(),
+        archived: false,
+    };
+    let config_path = target_dir.join("config.json");
+    let config_json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    fs::write(config_path, config_json).map_err(|e| e.to_string())?;
+
+    Ok(format!("コンテスト '{}' を作成しました！", name))
+}
+
+#[tauri::command]
+async fn create_contest_from_bytes(
+    name: String,
+    zip_bytes: Vec<u8>,
+    optimize_target: String,
+    variables: String,
+) -> Result<String, String> {
+    let target_dir = &get_workspaces_dir().join(&name);
+    if target_dir.exists() {
+        return Err("既に同じ名前が存在します".to_string());
+    }
+
+    fs::create_dir_all(&target_dir).map_err(|e| format!("ディレクトリ作成失敗: {}", e))?;
+    extract_zip_bytes(target_dir, &zip_bytes)?;
+
+    let config = ContestConfig {
+        name: name.clone(),
+        tools_dir: target_dir.to_string_lossy().to_string(),
+        optimize_target,
+        variables,
+        score_display: "sum".to_string(),
+        archived: false,
     };
     let config_path = target_dir.join("config.json");
     let config_json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
@@ -255,6 +340,7 @@ async fn delete_contest(name: String) -> Result<String, String> {
 async fn reset_visualizer_cache(contest_name: String) -> Result<(), String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
+    ensure_contest_not_archived(&contest_dir, &contest_name)?;
     let tools_dir = find_tools_dir(&contest_dir);
     let web_vis_dir = tools_dir.join("web_vis");
     if web_vis_dir.exists() {
@@ -302,6 +388,7 @@ async fn get_visualizer_data(
 ) -> Result<VisualizerData, String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
+    ensure_contest_not_archived(&contest_dir, &contest_name)?;
     let tools_dir = find_tools_dir(&contest_dir);
     let exe_suffix = std::env::consts::EXE_SUFFIX;
 
@@ -561,6 +648,7 @@ window.addEventListener('message', (event) => {{
 async fn generate_inputs(contest_name: String, test_cases: usize) -> Result<String, String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
+    ensure_contest_not_archived(&contest_dir, &contest_name)?;
     let tools_dir = find_tools_dir(&contest_dir);
 
     let seeds_path = tools_dir.join("seeds.txt");
@@ -593,6 +681,7 @@ async fn setup_submission(
 ) -> Result<String, String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
+    ensure_contest_not_archived(&contest_dir, &contest_name)?;
     let tools_dir = find_tools_dir(&contest_dir);
     let exe_suffix = std::env::consts::EXE_SUFFIX;
 
@@ -742,6 +831,7 @@ async fn run_test_case(
 ) -> Result<TestCaseResult, String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
+    ensure_contest_not_archived(&contest_dir, &contest_name)?;
     let tools_dir = find_tools_dir(&contest_dir);
     let exe_suffix = std::env::consts::EXE_SUFFIX;
 
@@ -1110,11 +1200,14 @@ async fn save_testcase_favorites(
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 struct ContestConfig {
     name: String,
     tools_dir: String,
     optimize_target: String,
     variables: String,
+    score_display: String,
+    archived: bool,
 }
 
 impl Default for ContestConfig {
@@ -1124,6 +1217,8 @@ impl Default for ContestConfig {
             tools_dir: "".to_string(),
             optimize_target: "maximize".to_string(),
             variables: "".to_string(),
+            score_display: "sum".to_string(),
+            archived: false,
         }
     }
 }
@@ -1131,13 +1226,10 @@ impl Default for ContestConfig {
 #[tauri::command]
 async fn get_contest_config(contest_name: String) -> Result<ContestConfig, String> {
     let base_dir = get_workspaces_dir();
-    let config_file = base_dir.join(&contest_name).join("config.json");
+    let contest_dir = base_dir.join(&contest_name);
 
-    if config_file.exists() {
-        let content = fs::read_to_string(config_file).unwrap_or_else(|_| "{}".to_string());
-        let mut config: ContestConfig = serde_json::from_str(&content).unwrap_or_default();
-        config.name = contest_name.clone();
-        Ok(config)
+    if contest_dir.join("config.json").exists() {
+        Ok(load_contest_config_sync(&contest_dir, &contest_name))
     } else {
         let mut config = ContestConfig::default();
         config.name = contest_name;
@@ -1174,6 +1266,7 @@ async fn get_testcase_variables(
 ) -> Result<HashMap<usize, HashMap<String, f64>>, String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
+    let cache_file = contest_dir.join("testcase_vars.json");
 
     let config_file = contest_dir.join("config.json");
     let config: ContestConfig = if config_file.exists() {
@@ -1191,6 +1284,12 @@ async fn get_testcase_variables(
     let tools_dir = find_tools_dir(&contest_dir);
     let in_dir = tools_dir.join("in");
     if !in_dir.exists() {
+        if cache_file.exists() {
+            let content = fs::read_to_string(cache_file).unwrap_or_else(|_| "{}".to_string());
+            let cached: HashMap<usize, HashMap<String, f64>> =
+                serde_json::from_str(&content).unwrap_or_default();
+            return Ok(cached);
+        }
         return Ok(HashMap::new());
     }
 
@@ -1226,13 +1325,86 @@ async fn get_testcase_variables(
         }
     }
 
+    let json = serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?;
+    let _ = fs::write(&cache_file, json);
+
     Ok(result)
+}
+
+#[tauri::command]
+async fn archive_contest(contest_name: String) -> Result<(), String> {
+    let base_dir = get_workspaces_dir();
+    let contest_dir = base_dir.join(&contest_name);
+    if !contest_dir.exists() {
+        return Err("コンテストディレクトリが存在しません".to_string());
+    }
+
+    let mut config = load_contest_config_sync(&contest_dir, &contest_name);
+    if config.archived {
+        return Ok(());
+    }
+
+    let submissions_path = contest_dir.join("submissions.json");
+    if submissions_path.exists() {
+        let content = fs::read_to_string(&submissions_path).unwrap_or_else(|_| "[]".to_string());
+        let mut submissions: serde_json::Value =
+            serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!([]));
+        if let Some(items) = submissions.as_array_mut() {
+            for item in items.iter_mut() {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("code".to_string(), serde_json::json!(""));
+                    obj.insert("compileError".to_string(), serde_json::Value::Null);
+                    if let Some(test_cases) =
+                        obj.get_mut("testCases").and_then(|value| value.as_array_mut())
+                    {
+                        for tc in test_cases.iter_mut() {
+                            if let Some(tc_obj) = tc.as_object_mut() {
+                                tc_obj.insert("error_msg".to_string(), serde_json::json!(""));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let sanitized = serde_json::to_string_pretty(&submissions).map_err(|e| e.to_string())?;
+        fs::write(&submissions_path, sanitized).map_err(|e| e.to_string())?;
+    }
+
+    let _ = get_testcase_variables(contest_name.clone()).await;
+
+    let tools_dir = find_tools_dir(&contest_dir);
+    for path in [
+        contest_dir.join("out"),
+        contest_dir.join("a.out"),
+        contest_dir.join(format!("a.out{}", std::env::consts::EXE_SUFFIX)),
+        contest_dir.join("main.cpp"),
+        contest_dir.join("main.py"),
+        contest_dir.join("main.rs"),
+        contest_dir.join("rust_src"),
+        tools_dir.join("in"),
+        tools_dir.join("web_vis"),
+    ] {
+        if path.exists() {
+            if path.is_dir() {
+                fs::remove_dir_all(&path).map_err(|e| format!("アーカイブ失敗: {}", e))?;
+            } else {
+                fs::remove_file(&path).map_err(|e| format!("アーカイブ失敗: {}", e))?;
+            }
+        }
+    }
+
+    config.archived = true;
+    let config_path = contest_dir.join("config.json");
+    let config_json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    fs::write(config_path, config_json).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
 async fn update_tools_from_zip(contest_name: String, zip_path: String) -> Result<(), String> {
     let base_dir = get_workspaces_dir();
     let contest_dir = base_dir.join(&contest_name);
+    ensure_contest_not_archived(&contest_dir, &contest_name)?;
 
     if !contest_dir.exists() {
         return Err("コンテストディレクトリが存在しません".to_string());
@@ -1259,6 +1431,19 @@ async fn update_tools_from_zip(contest_name: String, zip_path: String) -> Result
     }
 
     Ok(())
+}
+
+#[tauri::command]
+async fn update_tools_from_bytes(contest_name: String, zip_bytes: Vec<u8>) -> Result<(), String> {
+    let base_dir = get_workspaces_dir();
+    let contest_dir = base_dir.join(&contest_name);
+    ensure_contest_not_archived(&contest_dir, &contest_name)?;
+
+    if !contest_dir.exists() {
+        return Err("コンテストディレクトリが存在しません".to_string());
+    }
+
+    extract_zip_bytes(&contest_dir, &zip_bytes)
 }
 
 #[tauri::command]
@@ -1434,6 +1619,7 @@ fn main() {
             get_visualizer_data,
             get_contests,
             create_contest,
+            create_contest_from_bytes,
             delete_contest,
             save_submissions,
             load_submissions,
@@ -1451,7 +1637,9 @@ fn main() {
             save_contest_config,
             get_available_parallelism,
             get_testcase_variables,
+            archive_contest,
             update_tools_from_zip,
+            update_tools_from_bytes,
             rename_contest
         ])
         .run(tauri::generate_context!())
